@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 
 ###########################################################################
@@ -22,8 +23,11 @@ from PIL import Image
 from wx.lib.newevent import NewEvent
 
 import matplotlib
-matplotlib.use('Agg')  # 无 GUI 模式，只画图不弹窗
 import matplotlib.pyplot as plt
+matplotlib.use("WXAgg")
+from matplotlib.backends.backend_wxagg import FigureCanvasWxAgg as FigureCanvas
+from matplotlib.figure import Figure
+
 import io
 import pytesseract
 
@@ -48,6 +52,47 @@ class TriggrRightPanelDisplayEvent(wx.PyCommandEvent):
 myEVT_RIGHT_DISPLAY = wx.NewEventType() 
 # 3、 创建一个绑定器对象
 EVT_RIGHT_DISPLAY = wx.PyEventBinder(myEVT_RIGHT_DISPLAY, 1)  
+
+
+###########################################################################
+## Class AlgorithmPanelBase - 所有算法面板的公共基类
+###########################################################################
+
+class AlgorithmPanelBase( wx.Panel ):
+    """算法面板公共基类，统一：
+       1. 构造流程（wx.Panel 初始化 + parent_frame 引用）
+       2. 结果输出（finish：ndarray -> PIL -> 主框架 processed_pil_image）
+       3. 显示事件通知（fire_display_event）
+       4. RadioBox 分发（run_algorithm + ALGORITHM_METHODS 表驱动）
+    """
+    ALGORITHM_METHODS = []  # 子类按 RadioBox 顺序覆写
+
+    def __init__( self, parent ):
+        wx.Panel.__init__( self, parent )
+        self.parent_frame = parent
+
+    # ---------- 结果输出 ----------
+    def finish( self, img ):
+        """将算法结果写入主框架并触发右侧刷新。
+           img: BGR(3通道) ndarray 自动转 RGB；灰度/单通道(2维) ndarray 直接输出。"""
+        if isinstance( img, np.ndarray ) and img.ndim == 2:
+            pil_img = Image.fromarray( img )
+        else:
+            pil_img = Image.fromarray( cv2.cvtColor( img, cv2.COLOR_BGR2RGB ) )
+        self.parent_frame.processed_pil_image = pil_img
+        self.fire_display_event()
+
+    def fire_display_event( self ):
+        """通知主框架刷新右侧显示面板。"""
+        evt = TriggrRightPanelDisplayEvent( myEVT_RIGHT_DISPLAY, self.GetId() )
+        self.GetEventHandler().ProcessEvent( evt )
+
+    # ---------- RadioBox 表驱动分发 ----------
+    def run_algorithm( self, index ):
+        """按 ALGORITHM_METHODS 表调用对应算法方法。"""
+        if 0 <= index < len( self.ALGORITHM_METHODS ):
+            getattr( self, self.ALGORITHM_METHODS[index] )()
+
 
 ###########################################################################
 ## Class cvToolDemo
@@ -167,6 +212,7 @@ class cvTool ( wx.Frame ):
         imageSizer = wx.FlexGridSizer( 0, 2, 0, 0 )
         imageSizer.SetFlexibleDirection( wx.BOTH )
         imageSizer.SetNonFlexibleGrowMode( wx.FLEX_GROWMODE_ALL )
+
         self.imageStaticText = wx.StaticText( self, wx.ID_ANY, _(u"原图"), wx.DefaultPosition, wx.Size( -1,30 ), wx.ALIGN_CENTER_HORIZONTAL )
         self.imageStaticText.Wrap( -1 )
         self.imageStaticText.SetFont( wx.Font( 20, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD, False, wx.EmptyString ) )
@@ -174,24 +220,27 @@ class cvTool ( wx.Frame ):
         self.imageStaticText.SetBackgroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_ACTIVECAPTION ) )
         self.imageStaticText.SetMinSize( wx.Size( 800,30 ) )
         imageSizer.Add( self.imageStaticText, 0, wx.ALIGN_CENTER_HORIZONTAL, 10 )
+        
         self.imageProcessedStaticText = wx.StaticText( self, wx.ID_ANY, _(u"处理后图片"), wx.DefaultPosition, wx.Size( -1,30 ), wx.ALIGN_CENTER_HORIZONTAL )
         self.imageProcessedStaticText.Wrap( -1 )
-
         self.imageProcessedStaticText.SetFont( wx.Font( 20, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, False, wx.EmptyString ) )
         self.imageProcessedStaticText.SetForegroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_BACKGROUND ) )
         self.imageProcessedStaticText.SetBackgroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_ACTIVECAPTION ) )
         self.imageProcessedStaticText.SetMinSize( wx.Size( 800,30 ) )
         imageSizer.Add( self.imageProcessedStaticText, 1, wx.ALIGN_CENTER_HORIZONTAL, 5 )
 
-        self.leftImagePanel = wx.Panel( self, wx.ID_ANY, wx.DefaultPosition, wx.Size( -1,-1 ), wx.BORDER_SIMPLE )
-        self.leftImagePanel.SetForegroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
-        self.leftImagePanel.SetBackgroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
-        self.leftImagePanel.SetMinSize( wx.Size( 800,600 ) )
+        self.leftImagePanel = ImagePanel(self)
+        # self.leftImagePanel = wx.Panel( self, wx.ID_ANY, wx.DefaultPosition, wx.Size( -1,-1 ), wx.BORDER_SIMPLE )
+        # self.leftImagePanel.SetForegroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
+        # self.leftImagePanel.SetBackgroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
+        # self.leftImagePanel.SetMinSize( wx.Size( 800,600 ) )        
         imageSizer.Add( self.leftImagePanel, 1, wx.ALIGN_BOTTOM|wx.ALIGN_CENTER_HORIZONTAL, 5 )
 
-        self.rightImagePanel = wx.Panel( self, wx.ID_ANY, wx.DefaultPosition, wx.Size( -1,-1 ), wx.BORDER_SIMPLE )
-        self.rightImagePanel.SetBackgroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
-        self.rightImagePanel.SetMinSize( wx.Size( 800,600 ) )
+        self.rightImagePanel = ImagePanel(self)
+        # self.rightImagePanel = wx.Panel( self, wx.ID_ANY, wx.DefaultPosition, wx.Size( -1,-1 ), wx.BORDER_SIMPLE )        
+        # self.rightImagePanel.SetForegroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
+        # self.rightImagePanel.SetBackgroundColour( wx.SystemSettings.GetColour( wx.SYS_COLOUR_WINDOW ) )
+        # self.rightImagePanel.SetMinSize( wx.Size( 800,600 ) )
         imageSizer.Add( self.rightImagePanel, 1, wx.ALIGN_BOTTOM|wx.ALIGN_LEFT, 5 )
 
         frameSizer.Add( imageSizer, 0, 0, 5 )
@@ -267,12 +316,14 @@ class cvTool ( wx.Frame ):
         self.statusBar = self.CreateStatusBar( 1, wx.STB_SIZEGRIP, wx.ID_ANY )
         self.Centre( wx.BOTH )
 
+
         # 当前显示面板
         self.current_panel = None
         # 原图 和 处理后图片数据保存变量
         self.original_pil_image  = None 
         self.processed_pil_image = None 
 
+        # image_show
         self.bitmap              = None  # 当前左panel显示的wx.Bitmap
         self.processed_bitmap    = None  # 当前右panel显示的wx.Bitmap
 
@@ -330,32 +381,37 @@ class cvTool ( wx.Frame ):
         logging.info("run __del__ ")
         pass
 
-    def PanelOnPaint( self, bitmap, image_panel ):        
-        """绘制图片和截图框"""
-        dc = wx.PaintDC(image_panel)
-        if bitmap:
-            dc.DrawBitmap(bitmap, 0, 0)
-        # 绘制拖拽中的矩形框
-        if self.start_pos and self.current_pos:
-            x1, y1 = self.start_pos
-            x2, y2 = self.current_pos
-            left, top = min(x1, x2), min(y1, y2)
-            width, height = abs(x2 - x1), abs(y2 - y1)
-            if 0:
-                dc.SetPen(wx.Pen(wx.Colour(255, 0, 0), 2))
-                dc.SetBrush(wx.Brush(wx.Colour(255, 0, 0, 50)))
-            else:
-                dc.SetPen(wx.Pen(wx.Colour(100, 150, 200), 2))
-                # 外框天蓝色，框内透明
-                dc.SetBrush(wx.Brush("sky blue", wx.TRANSPARENT))
-            dc.DrawRectangle(left, top, width, height)
+    def PanelOnPaint( self, bitmap, image_panel ,display_mode): 
+        if display_mode == 1:
+            pass
+        else:
+            return
+
+            """绘制图片和截图框"""
+            dc = wx.PaintDC(image_panel)
+            if bitmap:
+                dc.DrawBitmap(bitmap, 0, 0)
+            # 绘制拖拽中的矩形框
+            if self.start_pos and self.current_pos:
+                x1, y1 = self.start_pos
+                x2, y2 = self.current_pos
+                left, top = min(x1, x2), min(y1, y2)
+                width, height = abs(x2 - x1), abs(y2 - y1)
+                if 0:
+                    dc.SetPen(wx.Pen(wx.Colour(255, 0, 0), 2))
+                    dc.SetBrush(wx.Brush(wx.Colour(255, 0, 0, 50)))
+                else:
+                    dc.SetPen(wx.Pen(wx.Colour(100, 150, 200), 2))
+                    # 外框天蓝色，框内透明
+                    dc.SetBrush(wx.Brush("sky blue", wx.TRANSPARENT))
+                dc.DrawRectangle(left, top, width, height)
 
     def leftPanelOnPaint( self, event ): 
-        self.PanelOnPaint(self.bitmap,self.leftImagePanel)
+        self.PanelOnPaint(self.bitmap,self.leftImagePanel,1)
         event.Skip()
 
     def rightPanelOnPaint( self, event ): 
-        self.PanelOnPaint(self.processed_bitmap,self.rightImagePanel)        
+        self.PanelOnPaint(self.processed_bitmap,self.rightImagePanel,1)        
         event.Skip()       
 
     def OnDoRightPanelImageDisplayEvent(self, event):
@@ -371,7 +427,14 @@ class cvTool ( wx.Frame ):
         event.Skip()
 
     def display_image(self, pil_image, display_flag):
-        """按Panel大小缩放显示图片"""
+        """显示方式二：pil_image在画板上直接画图"""
+        if display_flag == 0:
+            self.leftImagePanel.show_image(self.original_pil_image)
+        else:
+            self.rightImagePanel.show_image(self.processed_pil_image)
+        return
+
+        """显示方式一：按Panel大小缩放显示图片，输入的图片为PIL Image格式,再转换为bitmap格式"""
         if not pil_image:
             return
         
@@ -597,10 +660,33 @@ class cvTool ( wx.Frame ):
         wx.adv.AboutBox(info)
         event.Skip()
 
-class ColorExtractionPanel(wx.Panel):
+class ImagePanel(AlgorithmPanelBase):
+    def __init__(self, parent):
+        super().__init__(parent)
+
+        # 每个 panel 独立创建自己的 Figure 和 Canvas
+        self.figure = Figure()
+        self.axes   = self.figure.add_subplot(111)
+        self.axes.axis('off')  # 不显示坐标轴
+        self.canvas = FigureCanvas(self, -1, self.figure)
+        
+        # 用 sizer 让 canvas 填满 panel
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(self.canvas, 1, wx.EXPAND | wx.ALL, 5)
+        self.SetSizer(sizer)
+        self.Layout()
+    
+    def show_image(self, img_array):
+        """传入 numpy 数组显示图片"""
+        self.axes.clear()
+        self.axes.axis('off')
+        self.axes.imshow(img_array)
+        self.canvas.draw()
+
+class ColorExtractionPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageProcessBGR2GRAY", "imageProcessBGR2HSV", "imageProcessRGB2BGR", "imageProcessBGR2YCrCb"]
     def __init__(self, parent):
         super().__init__(parent)  # 只调用了父类 wx.Panel 的构造函数
-        self.parent_frame = parent  # 保存 Frame 引用
         
         m_radioBox2Choices  = [ _(u"BGR2GRAY"), _(u"BGR2HSV"), _(u"RGB2BGR"), _(u"BGR2YCrCb") ]
         self.m_radioBox2    = wx.RadioBox( self, wx.ID_ANY, _(u"选择转换色彩空间"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 4, wx.RA_SPECIFY_COLS )
@@ -612,27 +698,10 @@ class ColorExtractionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageProcessOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件 
 
     def imageProcessOnRadioBox( self, event ):
-        if self.m_radioBox2.GetSelection() == 0:
-            self.imageProcessBGR2GRAY()
-            pass
-        elif self.m_radioBox2.GetSelection() == 1: 
-            self.imageProcessBGR2HSV() 
-            pass
-        elif self.m_radioBox2.GetSelection() == 2:
-            self.imageProcessRGB2BGR()
-            pass
-        elif self.m_radioBox2.GetSelection() == 3:
-            self.imageProcessBGR2YCrCb()
-        else:
-            print("error")
-            event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
-    # 图像处理算法
     def imageProcessBGR2GRAY( self ):  
         pil_img =self.parent_frame.original_pil_image       
         if pil_img:
@@ -646,10 +715,7 @@ class ColorExtractionPanel(wx.Panel):
             img_bgr_new         = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
 
             # 4. Conert BGR to RGB（PIL 需要 RGB 顺序）
-            img_rgb             = cv2.cvtColor(img_bgr_new, cv2.COLOR_BGR2RGB)
-
-            # 5. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr_new)
 
     def imageProcessBGR2HSV( self ):
         """OpenCV 的 cv2.imread() 读取结果是 numpy.ndarray 数组，
@@ -688,10 +754,7 @@ class ColorExtractionPanel(wx.Panel):
             img_bgr_new         = cv2.cvtColor(processed_hsv_img, cv2.COLOR_HSV2BGR)
 
             # 7. Conert BGR to RGB（PIL 需要 RGB 顺序）
-            img_rgb             = cv2.cvtColor(img_bgr_new, cv2.COLOR_BGR2RGB)
-
-            # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr_new)
 
     def imageProcessRGB2BGR( self ):
         pil_img = self.parent_frame.original_pil_image        
@@ -700,7 +763,9 @@ class ColorExtractionPanel(wx.Panel):
             img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
 
             # 2. BGR 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.processed_pil_image = Image.fromarray(img_bgr)
+            #    （故意不做 BGR->RGB 还原，以展示 RGB2BGR 后红蓝通道互换的视觉效果）
+            self.parent_frame.processed_pil_image = Image.fromarray(img_bgr)
+            self.fire_display_event()
 
     def imageProcessBGR2YCrCb( self ):
         pil_img = self.parent_frame.original_pil_image
@@ -708,22 +773,18 @@ class ColorExtractionPanel(wx.Panel):
             # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
             img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
 
-            # 2、 Convert BGR to GRAY
-            gray_img    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+            # 2、 Convert BGR to YCrCb
+            ycrcb_img   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
 
-            # 3. Convert GRAY to BGR（转回才能正常显示或保存）
-            img_bgr_new = cv2.cvtColor(gray_img, cv2.COLOR_BGR2YCrCb)
+            # 3. Convert YCrCb back to BGR（转回才能正常显示或保存）
+            img_bgr_new = cv2.cvtColor(ycrcb_img, cv2.COLOR_YCrCb2BGR)
 
             # 4. Conert BGR to RGB（PIL 需要 RGB 顺序）
-            img_rgb     = cv2.cvtColor(img_bgr_new, cv2.COLOR_BGR2RGB)
+            self.finish(img_bgr_new)
 
-            # 5. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
-
-class ImageDifferencePanel(wx.Panel):
+class ImageDifferencePanel(AlgorithmPanelBase):
     def __init__(self, parent,):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageDiff = wx.Button( self, wx.ID_ANY, _(u"计算图像差"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.VERTICAL )        
@@ -732,11 +793,10 @@ class ImageDifferencePanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageDiff.Bind( wx.EVT_BUTTON, self.imageDiffBtnClick )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
     def imageDiffBtnClick( self, event ):
         self.imageProcessDiff()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageProcessDiff( self ):
@@ -755,14 +815,11 @@ class ImageDifferencePanel(wx.Panel):
         diff = cv2.absdiff(gray_img_1, gray_img_2)
         # 3. Convert GRAY to BGR（转回才能正常显示或保存）
         diff_new    = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR) 
-        img_rgb     = cv2.cvtColor(diff_new, cv2.COLOR_BGR2RGB)
+        self.finish(diff_new)
 
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb) 
-
-class ImageStitchingPanel(wx.Panel):
+class ImageStitchingPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageStitch  = wx.Button( self, wx.ID_ANY, _(u"开始图像拼接"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.VERTICAL )        
@@ -771,11 +828,10 @@ class ImageStitchingPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageStitch.Bind( wx.EVT_BUTTON, self.imageStitchBtnClick )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件 
 
     def imageStitchBtnClick( self, event ):
         self.imageProcessStitch()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageProcessStitch( self ):
@@ -800,14 +856,12 @@ class ImageStitchingPanel(wx.Panel):
             pano_rgb = cv2.cvtColor(np.asarray(pano), cv2.COLOR_BGR2RGB)
             # RGB -> PIL Image
             self.parent_frame.processed_pil_image = Image.fromarray(pano_rgb)
-            logging.info(self.parent_frame.processed_pil_image)
         else:
             logging.error(f"拼接失败，错误码：{status}")
 
-class HistogramPanel(wx.Panel):
+class HistogramPanel(AlgorithmPanelBase):
     def __init__(self, parent):  # 定义构造方法，parent 是外部传入的父对象
         super().__init__(parent) # 调用父类的构造方法，并把 parent 传进去。这样父类能完成自身初始化，比如设置 Qt/C++ 层面的父子关系
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageHist = wx.Button( self, wx.ID_ANY, _(u"生成直方图"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.VERTICAL )        
@@ -816,11 +870,10 @@ class HistogramPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageHist.Bind( wx.EVT_BUTTON, self.imageHistBtnClick )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件 
 
     def imageHistBtnClick( self, event):
         self.imageProcessHist()        
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageProcessHist( self ):
@@ -851,10 +904,11 @@ class HistogramPanel(wx.Panel):
             self.parent_frame.processed_pil_image = Image.open(buf).copy()
 
 
-class ColorSpaceAndChannelExtractionPanel(wx.Panel):
+class ColorSpaceAndChannelExtractionPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageProcessBGR2B", "imageProcessBGR2G", "imageProcessBGR2R",
+                         "imageProcessHSV2H", "imageProcessHSV2S", "imageProcessHSV2V"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"BGR图片提取B通道"), _(u"BGR图片提取G通道"), _(u"BGR图片提取R通道"), _(u"HSV图片提取H通道"), _(u"HSV图片提取S通道"), _(u"HSV图片提取V通道") ]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"算法选择"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 6, wx.RA_SPECIFY_COLS )
@@ -865,25 +919,9 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageProcessChannelExtraction )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件  
 
     def imageProcessChannelExtraction( self, event ):              
-        if self.m_radioBox2.GetSelection() == 0:
-            self.imageProcessBGR2B()
-        elif self.m_radioBox2.GetSelection() == 1: 
-            self.imageProcessBGR2G() 
-        elif self.m_radioBox2.GetSelection() == 2:
-            self.imageProcessBGR2R()
-        elif self.m_radioBox2.GetSelection() == 3:
-            self.imageProcessHSV2H()
-        elif self.m_radioBox2.GetSelection() == 4:
-            self.imageProcessHSV2S()
-        elif self.m_radioBox2.GetSelection() == 5:
-            self.imageProcessHSV2V()
-        else:
-            print("error")
-            event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
 
     def imageProcessBGR2B(self):
@@ -897,7 +935,7 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
             b,g,r = cv2.split(img_bgr)            
 
             # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.processed_pil_image = Image.fromarray(b)
+            self.finish(b)
 
     def imageProcessBGR2G(self):       
         pil_img = self.parent_frame.original_pil_image    # <PIL.PngImagePlugin.PngImageFile image mode=RGB size=750x437 at 0x2CCC8D71C70>
@@ -910,7 +948,7 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
             b,g,r = cv2.split(img_bgr)            
 
             # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(g)
+            self.finish(g)
 
     def imageProcessBGR2R(self):
         pil_img = self.parent_frame.original_pil_image
@@ -921,7 +959,7 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
             b,g,r   = cv2.split(img_bgr)
 
             # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(r)
+            self.finish(r)
 
     def imageProcessHSV2H(self):
         pil_img = self.parent_frame.original_pil_image
@@ -929,7 +967,7 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
             img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             hsv_img         = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             h,s,v           = cv2.split(hsv_img)
-            self.parent_frame.processed_pil_image = Image.fromarray(h)
+            self.finish(h)
 
     def imageProcessHSV2S(self):
         pil_img = self.parent_frame.original_pil_image
@@ -937,7 +975,7 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
             img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             hsv_img         = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             h,s,v           = cv2.split(hsv_img)
-            self.parent_frame.processed_pil_image = Image.fromarray(s)
+            self.finish(s)
 
     def imageProcessHSV2V(self):
         pil_img = self.parent_frame.original_pil_image
@@ -945,13 +983,12 @@ class ColorSpaceAndChannelExtractionPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             hsv_img             = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             h,s,v               = cv2.split(hsv_img)
-            self.parent_frame.processed_pil_image = Image.fromarray(v)     
+            self.finish(v)     
 
 
-class EqualizationPanel(wx.Panel):
+class EqualizationPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageProcess = wx.Button( self, wx.ID_ANY, _(u"图像均衡化处理"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.VERTICAL )        
@@ -960,11 +997,10 @@ class EqualizationPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageProcess.Bind( wx.EVT_BUTTON, self.imageEqualizationBtnClick )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageEqualizationBtnClick( self, event ):
         self.imageProcessEqualization()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     # 预处理算法
@@ -977,18 +1013,17 @@ class EqualizationPanel(wx.Panel):
             img_yuv             = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
             img_yuv[:,:,0]      = cv2.equalizeHist(img_yuv[:,:,0]) # 只处理Y亮度通道
             img_yuv_bgr         = cv2.cvtColor(img_yuv, cv2.COLOR_YCrCb2BGR)
-            img_rgb             = cv2.cvtColor(img_yuv_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_yuv_bgr)
             # 全局均衡化易放大噪声、在光照不均时效果差
 
             # CLAHE算法
             # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             # result = clahe.apply()
 
-class ThresholdProcessingPanel(wx.Panel):
+class ThresholdProcessingPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageThresBINARY", "imageThresBINARYINV", "imageThresTRUNC", "imageThresTOZERO", "imageThresTOZEROINV", "imageThresMEANC", "imageThresGAUSSIANC", "imageThresOtsu", "imageThresTriangle", "imageThresIterative", "imageThresNiblack", "imageThresSauvola", "imageThresMEM", "imageThresMultiDomainSegmentation"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"BINARY(白底黑字)"), _(u"BINARY_INV(反色二值化)"), _(u"TRUNC(压暗高光区)"), _(u"TOZERO(除暗留亮)"),\
         _(u"TOZERO_INV(除亮留暗)"),  _(u"MEAN_C(局部均值法)"), _(u"GAUSSIAN_C(局部高斯加权法)"), _(u"Otsu(大津法)"),\
@@ -1001,44 +1036,10 @@ class ThresholdProcessingPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageThresholdOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageThresholdOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageThresBINARY()
-            case 1:
-                self.imageThresBINARYINV()
-            case 2:
-                self.imageThresTRUNC()
-            case 3:
-                self.imageThresTOZERO()
-            case 4:
-                self.imageThresTOZEROINV()
-            case 5:
-                self.imageThresMEANC()
-            case 6:
-                self.imageThresGAUSSIANC()
-            case 7:
-                 self.imageThresOtsu() 
-            case 8:
-                self.imageThresTriangle()
-            case 9:
-                self.imageThresIterative()
-            case 10:
-                self.imageThresNiblack()
-            case 11:
-                self.imageThresSauvola()
-            case 12:
-                self.imageThresMEM()
-            case 13:
-                self.imageThresMultiDomainSegmentation()
-            case _:        
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageThresholdOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageThresBINARY(self):
         '''黑字白底阈值算法'''        
         pil_img = self.parent_frame.original_pil_image
@@ -1047,9 +1048,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_BINARY)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresBINARYINV(self):        
         pil_img = self.parent_frame.original_pil_image
@@ -1058,9 +1057,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_BINARY_INV)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresTRUNC(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1069,9 +1066,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_TRUNC)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresTOZERO(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1080,9 +1075,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_TOZERO)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresTOZEROINV(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1091,9 +1084,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_TOZERO_INV)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresMEANC(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1102,9 +1093,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             img_binary = cv2.adaptiveThreshold(img_gray, 255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY, 3, 0) 
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresGAUSSIANC(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1113,9 +1102,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             img_binary = cv2.adaptiveThreshold(img_gray, 255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,5, 0)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresOtsu(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1124,9 +1111,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 0,255,cv2.THRESH_BINARY + cv2.THRESH_OTSU )
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresTriangle(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1135,9 +1120,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             ret,img_binary      = cv2.threshold(img_gray, 0,255,cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE )
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresIterative(self):
         '''迭代阈值法'''
@@ -1181,9 +1164,7 @@ class ThresholdProcessingPanel(wx.Panel):
             T = iterative_threshold(img_gray,1)
              # 用最终阈值做二值化
             _,img_binary = cv2.threshold(img_gray, T,255,cv2.THRESH_BINARY)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresNiblack(self):
         def niblack_threshold(img, window_size=25, k=-0.2):
@@ -1220,8 +1201,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             img_binary = niblack_threshold(img_gray, window_size=25, k=-0.2)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresSauvola(self):
         def sauvola_threshold(image, window_size=25, k=0.2, r=128):
@@ -1252,9 +1232,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             img_binary = sauvola_threshold(img_gray, window_size=25, k=-0.2)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresMEM(self):
         def mem_threshold(img):
@@ -1309,8 +1287,7 @@ class ThresholdProcessingPanel(wx.Panel):
             img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             best_thresh, binary = mem_threshold(img_gray)
             _,img_binary = cv2.threshold(binary, best_thresh, 255, cv2.THRESH_BINARY)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_GRAY2RGB)  
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_binary)
 
     def imageThresMultiDomainSegmentation(self):
         # ---------- 方法一：NumPy 分段映射 ----------
@@ -1365,10 +1342,10 @@ class ThresholdProcessingPanel(wx.Panel):
             img_rgb    = cv2.cvtColor(masks[0], cv2.COLOR_GRAY2RGB)
             self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)         
 
-class FilteringPanel(wx.Panel):
+class FilteringPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageProcessBlur", "imageProcessBoxBlur", "imageProcessGaussianBlur", "imageProcessMedianBlur", "imageProcessBilateral"]
     def __init__(self, parent):
         super().__init__(parent)  # 只调用了父类 wx.Panel 的构造函数
-        self.parent_frame = parent  # 保存 Frame 引用
         
         m_radioBox2Choices = [ _(u"均值Blur"), _(u"方框BoxBlur"), _(u"高斯GaussianBlur"), _(u"中值MedianBlur") , _(u"双边Bilateral")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"选择滤波算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 5, wx.RA_SPECIFY_COLS )
@@ -1379,34 +1356,17 @@ class FilteringPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageFilteringOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件 
 
-    def imageFilteringOnRadioBox( self, event ):              
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageProcessBlur()
-            case 1:
-                self.imageProcessBoxBlur()
-            case 2:
-                self.imageProcessGaussianBlur()
-            case 3:
-                self.imageProcessMedianBlur()
-            case 4:
-                self.imageProcessBilateral()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageFilteringOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageProcessBlur(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:
             img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             # 1. 均值滤波：核大小用元组(宽,高)，必须是奇数
             mean_blur  = cv2.blur(img_bgr, (5, 5))
-            img_rgb    = cv2.cvtColor(mean_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(mean_blur)
 
     def imageProcessBoxBlur(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1415,8 +1375,7 @@ class FilteringPanel(wx.Panel):
             # 2. 方框滤波：normalize=True时与均值滤波相同；False时求像素和，易溢出变白
             box_normal = cv2.boxFilter(img_bgr, -1, (5, 5), normalize=True)
             box_raw    = cv2.boxFilter(img_bgr, -1, (5, 5), normalize=False)
-            img_rgb    = cv2.cvtColor(box_raw, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(box_raw)
 
     def imageProcessGaussianBlur(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1426,30 +1385,27 @@ class FilteringPanel(wx.Panel):
             gaussian_blur  = cv2.GaussianBlur(img_bgr, (5, 5), 0)
             # 也可手动指定sigma，sigma越大越模糊
             gaussian_blur2 = cv2.GaussianBlur(img_bgr, (5, 5), 1.5)
-            img_rgb        = cv2.cvtColor(gaussian_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(gaussian_blur)
 
     def imageProcessMedianBlur(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:
             img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
             median_blur = cv2.medianBlur(img_bgr, 5)
-            img_rgb     = cv2.cvtColor(median_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)       
+            self.finish(median_blur)
 
     def imageProcessBilateral(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            # 1. 均值滤波：核大小用元组(宽,高)，必须是奇数
-            mean_blur  = cv2.blur(img_bgr, (5, 5))
-            img_rgb    = cv2.cvtColor(mean_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            img_bgr       = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            # 5. 双边滤波：能在去噪的同时保留边缘（d 直径、sigmaColor 颜色空间方差、sigmaSpace 坐标空间方差）
+            bilateral     = cv2.bilateralFilter(img_bgr, 9, 75, 75)
+            self.finish(bilateral)
 
-class MorphologicalOperationPanel(wx.Panel):
+class MorphologicalOperationPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageErosion", "imageDilation", "imageOpening", "imageClosing", "imageGradient", "imageTophat", "imageBlackhat"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"Erosion(腐蚀)"), _(u"Dilation(膨胀)"), _(u"Opening(开运算)"), _(u"Closing(闭运算)"),\
         _(u"Gradient(形态学梯度)"),  _(u"Top-hat(顶帽)"), _(u"Black-hat(黑帽)")]
@@ -1461,30 +1417,10 @@ class MorphologicalOperationPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageMorphologicalOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageMorphologicalOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageErosion()
-            case 1:
-                self.imageDilation()
-            case 2:
-                self.imageOpening()
-            case 3:
-                self.imageClosing()
-            case 4:
-                self.imageGradient()
-            case 5:
-                self.imageTophat()
-            case 6:
-                self.imageBlackhat()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageMorphologicalOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageErosion(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:            
@@ -1499,8 +1435,7 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 腐蚀
             eroded          = cv2.erode(binary, kernel_rect, iterations=1)
-            img_rgb         = cv2.cvtColor(eroded, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(eroded)
 
     def imageDilation(self) :
         pil_img = self.parent_frame.original_pil_image
@@ -1516,8 +1451,7 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 膨胀
             dilated         = cv2.dilate(binary, kernel_rect, iterations=1)
-            img_rgb         = cv2.cvtColor(dilated, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(dilated)
 
     def imageOpening(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1533,8 +1467,7 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 开运算（去噪）
             opened          = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_rect)
-            img_rgb         = cv2.cvtColor(opened, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(opened)
 
     def imageClosing(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1550,8 +1483,7 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 闭运算（补洞）
             closed          = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_rect)
-            img_rgb         = cv2.cvtColor(closed, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(closed)
 
     def imageGradient(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1567,8 +1499,7 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 形态学梯度（边缘）
             gradient        = cv2.morphologyEx(binary, cv2.MORPH_GRADIENT, kernel_rect)
-            img_rgb         = cv2.cvtColor(gradient, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)     
+            self.finish(gradient)
 
     def imageTophat(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1584,8 +1515,7 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 顶帽（提取亮细节）
             tophat          = cv2.morphologyEx(binary, cv2.MORPH_TOPHAT, kernel_rect)
-            img_rgb         = cv2.cvtColor(tophat, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(tophat)
 
     def imageBlackhat(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1601,13 +1531,11 @@ class MorphologicalOperationPanel(wx.Panel):
 
             # 黑帽（提取暗细节）
             blackhat        = cv2.morphologyEx(binary, cv2.MORPH_BLACKHAT, kernel_rect)
-            img_rgb         = cv2.cvtColor(blackhat, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(blackhat)
 
-class ROIPanel(wx.Panel):
+class ROIPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageDiff = wx.Button( self, wx.ID_ANY, _(u"自动感兴趣区域ROI人脸检测算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.VERTICAL )        
@@ -1616,11 +1544,10 @@ class ROIPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageDiff.Bind( wx.EVT_BUTTON, self.imageAutoROIBtnClick )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageAutoROIBtnClick( self, event ):
         self.imageAutoROI()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageAutoROI(self):        
@@ -1632,19 +1559,23 @@ class ROIPanel(wx.Panel):
             face_cascade    = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
             faces           = face_cascade.detectMultiScale(img_gray, scaleFactor=1.1, minNeighbors=5)            
 
+            if len(faces) == 0:
+                print("未检测到人脸")
+                return
+
             for (x, y, w, h) in faces:
                 pad = 20  # 往外扩一点，别裁太贴
+                # 注意：shape[1] 是宽度(x 方向上限)，shape[0] 是高度(y 方向上限)
                 x1, y1      = max(x-pad, 0), max(y-pad, 0)
-                x2, y2      = min(x+w+pad, img_gray.shape[0]), min(y+h+pad, img_gray.shape[1])
+                x2, y2      = min(x+w+pad, img_gray.shape[1]), min(y+h+pad, img_gray.shape[0])
                 face_roi    = img_gray[y1:y2, x1:x2].copy()
-            img_rgb         = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(face_roi)
   
 
-class CornerDetectionPanel(wx.Panel):
+class CornerDetectionPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageHarris", "imageShiTomasi", "imageOrb", "imageFast", "imageSift"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"Harris"), _(u"Shi-Tomasi"), _(u"ORB"), _(u"FAST"), _(u"SIFT")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"阈值处理"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 5, wx.RA_SPECIFY_COLS )
@@ -1655,26 +1586,10 @@ class CornerDetectionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageCornerDetectionOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageCornerDetectionOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageHarris()
-            case 1:
-                self.imageShiTomasi()
-            case 2:
-                self.imageOrb()
-            case 3:
-                self.imageFast()
-            case 4:
-                self.imageSift()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageCornerDetectionOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageHarris(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
@@ -1688,8 +1603,7 @@ class CornerDetectionPanel(wx.Panel):
             # 膨胀让角点更显眼，阈值取响应最大值的 1%~5%
             dst         = cv2.dilate(dst, None)
             img_bgr[dst > 0.01 * dst.max()] = [0, 0, 255]  # 红色标记
-            img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
 
     def imageShiTomasi(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1707,8 +1621,7 @@ class CornerDetectionPanel(wx.Panel):
                 for i in corners:
                     x, y = i.ravel()
                     cv2.circle(img_bgr, (x, y), 3, (0, 255, 0), -1)
-            img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
 
     def imageOrb(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1722,8 +1635,7 @@ class CornerDetectionPanel(wx.Panel):
             kp, des = orb.detectAndCompute(img_gray, None)
             # 3. 把关键点绘制在原图上
             img_with_kp = cv2.drawKeypoints(img_gray, kp, None, color=(0, 255, 0), flags=0)
-            img_rgb     = cv2.cvtColor(img_with_kp, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_with_kp)
 
     def imageFast(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1737,8 +1649,7 @@ class CornerDetectionPanel(wx.Panel):
             keypoints   = fast.detect(img_gray, None)
             img_kp      = cv2.drawKeypoints(img_bgr, keypoints, None, color=(0, 255, 0))
 
-            img_rgb     = cv2.cvtColor(img_kp, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_kp)
 
     def imageSift(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1753,13 +1664,12 @@ class CornerDetectionPanel(wx.Panel):
 
             # 4. 把关键点绘制在原图上
             img_with_kp = cv2.drawKeypoints(img_gray, kp, None, color=(0, 255, 0), flags=0)
-            img_rgb     = cv2.cvtColor(img_with_kp, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_with_kp)
 
-class EdgeDetectionPanel(wx.Panel):
+class EdgeDetectionPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageCanny", "imageSobel", "imageLaplacian", "imageScharr"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"Canny"), _(u"Sobel"), _(u"Laplacian"), _(u"Scharr")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"边缘检测算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 4, wx.RA_SPECIFY_COLS )
@@ -1770,24 +1680,10 @@ class EdgeDetectionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageEdgeDetectionOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageEdgeDetectionOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageCanny()
-            case 1:
-                self.imageSobel()
-            case 2:
-                self.imageLaplacian()
-            case 3:
-                self.imageScharr()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageEdgeDetectionOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageCanny(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
@@ -1798,8 +1694,7 @@ class EdgeDetectionPanel(wx.Panel):
 
             # 3. Canny边缘检测（低阈值50，高阈值150）
             edges       = cv2.Canny(blurred, 50, 150)
-            img_rgb     = cv2.cvtColor(edges, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(edges)
 
     def imageSobel(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1811,8 +1706,7 @@ class EdgeDetectionPanel(wx.Panel):
             sobel_y     = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)  # y方向
             sobel       = np.sqrt(sobel_x**2 + sobel_y**2)
             sobel_abs   = cv2.convertScaleAbs(sobel)
-            img_rgb     = cv2.cvtColor(sobel_abs, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(sobel_abs)
 
     def imageLaplacian(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1825,8 +1719,7 @@ class EdgeDetectionPanel(wx.Panel):
             laplacian       = cv2.Laplacian(img_gray, cv2.CV_64F, ksize=3)
             # 3. 取绝对值并转回 8 位图以便显示
             laplacian_abs   = cv2.convertScaleAbs(laplacian)
-            img_rgb     = cv2.cvtColor(laplacian_abs, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(laplacian_abs)
 
     def imageScharr(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1843,14 +1736,13 @@ class EdgeDetectionPanel(wx.Panel):
             abs_y           = cv2.convertScaleAbs(grad_y)
             # 4. 将两个方向加权合并（各占50%）
             scharr_xy       = cv2.addWeighted(abs_x, 0.5, abs_y, 0.5, 0)
-            img_rgb         = cv2.cvtColor(scharr_xy, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(scharr_xy)
 
 
-class GeometricShapePanel(wx.Panel):
+class GeometricShapePanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageHoughLinesP", "imageHoughCircles", "imageContour", "imageLineSegmentDetector", "imageFastLineDetector", "imageBlob", "imageEdgeDrawing", "imageHull", "imageLeastSquaresCircleFitting"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"HoughLinesP(霍夫线检测)"), _(u"HoughCircles(霍夫圆检测)"), _(u"Contour(轮廓)"), _(u"LSD(直线段检测)"), \
                               _(u"FLD(快速直线检测))"), _(u"Blob(斑点)"),_(u"EdgeDrawing(ED)"), _(u"Hull(凸包)"), _(u"LeastSquaresCircleFitting(最小二乘拟合圆)")]
@@ -1862,34 +1754,10 @@ class GeometricShapePanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageGeometricShapeOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageGeometricShapeOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageHoughLinesP()
-            case 1:
-                self.imageHoughCircles()
-            case 2:
-                self.imageContour()
-            case 3:
-                self.imageLineSegmentDetector()
-            case 4:
-                self.imageFastLineDetector()
-            case 5:
-                self.imageBlob()
-            case 6:
-                self.imageEdgeDrawing()
-            case 7:
-                self.imageHull()
-            case 8:
-                self.imageLeastSquaresCircleFitting()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageGeometricShapeOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageHoughLinesP(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
@@ -1913,8 +1781,7 @@ class GeometricShapePanel(wx.Panel):
                 for line in lines:
                     x1, y1, x2, y2 = line
                     cv2.line(img_gray, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            img_rgb         = cv2.cvtColor(img_gray, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_gray)
 
     def imageHoughCircles(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1935,8 +1802,8 @@ class GeometricShapePanel(wx.Panel):
                 for (x, y, r) in circles[0, :]:
                     cv2.circle(img_bgr, (x, y), r, (0, 255, 0), 2)   # 画圆
                     cv2.circle(img_bgr, (x, y), 2, (0, 0, 255), 3)   # 画圆心
-            img_rgb         = cv2.cvtColor(img_gray, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            # 显示画好圆的 BGR 结果图（此前误显示灰度图，检测圆不可见）
+            self.finish(img_bgr)
 
     def imageContour(self):
         pil_img = self.parent_frame.original_pil_image
@@ -1952,8 +1819,7 @@ class GeometricShapePanel(wx.Panel):
             # 4. 在原图上画出所有轮廓
             cv2.drawContours(img_bgr, contours, -1, (0, 255, 0), 2)
 
-            img_rgb             = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
 
 
     def imageLineSegmentDetector(self):
@@ -1979,8 +1845,7 @@ class GeometricShapePanel(wx.Panel):
                     x1, y1, x2, y2 = map(int, line)
                     cv2.line(result, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(result)
 
 
     def imageFastLineDetector(self):
@@ -2013,8 +1878,7 @@ class GeometricShapePanel(wx.Panel):
             #     x0, y0, x1, y1 = line
             #     cv2.line(drawn_img, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 0), 1)
             # 6. 转换为PIL Image格式（关键步骤：BGR → RGB）
-            img_rgb             = cv2.cvtColor(drawn_img, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(drawn_img)
 
     def imageBlob(self):
         pil_img = self.parent_frame.original_pil_image
@@ -2056,8 +1920,7 @@ class GeometricShapePanel(wx.Panel):
                 img_gray, keypoints, np.array([]), (0, 0, 255),
                 cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
             )
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)    
+            self.finish(result)
 
     def imageEdgeDrawing(self):
         pil_img = self.parent_frame.original_pil_image
@@ -2124,8 +1987,7 @@ class GeometricShapePanel(wx.Panel):
                 
                     cv2.ellipse(result, center, axes, angle, 0, 360, color, 2, cv2.LINE_AA)
 
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)                     
+            self.finish(result)
 
     def imageHull(self):
         pil_img = self.parent_frame.original_pil_image
@@ -2147,16 +2009,15 @@ class GeometricShapePanel(wx.Panel):
                 hull = cv2.convexHull(cnt)      # 默认 returnPoints=True，返回顶点坐标
                 cv2.polylines(result, [hull], True, (0, 0, 255), 2)
 
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(result)
 
     def imageLeastSquaresCircleFitting(self):
         pass
 
-class MovingObjectDetectionPanel(wx.Panel):
+class MovingObjectDetectionPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageHaar", "imageMatchTemplate", "imageHOG"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"Harr级联分类器)"), _(u"模板匹配"), _(u"HOG特征提取")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"目标检测算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 4, wx.RA_SPECIFY_COLS )
@@ -2167,22 +2028,10 @@ class MovingObjectDetectionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageMODOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageMODOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageHaar()
-            case 1:
-                self.imageMatchTemplate()
-            case 2:
-                self.imageHOG()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageMODOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageHaar(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
@@ -2207,8 +2056,7 @@ class MovingObjectDetectionPanel(wx.Panel):
                 cv2.rectangle(img_bgr, (x, y), (x + w, y + h), (0, 0, 255), 2)
 
             # 5. 关键步骤：OpenCV 默认是 BGR，PIL 需要 RGB，必须转换
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
 
     def imageMatchTemplate(self):        
         pil_img             = self.parent_frame.original_pil_image
@@ -2247,8 +2095,7 @@ class MovingObjectDetectionPanel(wx.Panel):
 
             # 6. 将 OpenCV 的 BGR 图转为 PIL Image
             # 关键：必须先把 BGR 转成 RGB，否则颜色会失真
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
 
     def imageHOG(self):
         pil_img = self.parent_frame.original_pil_image
@@ -2282,13 +2129,12 @@ class MovingObjectDetectionPanel(wx.Panel):
         
             # 6. 将 OpenCV 的 BGR 图转为 PIL Image
             # 关键：必须先把 BGR 转成 RGB，否则颜色会失真
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
 
-class ObjectDetectionPanel(wx.Panel):
+class ObjectDetectionPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageBackgroundSubstraction", "imageFrameDifferencing", "imageOpticalFlow"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"背景减除法(Background Subtraction)"), _(u"帧差法(Frame Differencing)"), _(u"光流法(Optical Flow)"), _(u"深度学习扩展")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"目标检测算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 4, wx.RA_SPECIFY_COLS )
@@ -2299,22 +2145,10 @@ class ObjectDetectionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageMODOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageMODOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageBackgroundSubstraction()
-            case 1:
-                self.imageFrameDifferencing()
-            case 2:
-                self.imageOpticalFlow()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageMODOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageBackgroundSubstraction(self):
         pass
 
@@ -2324,10 +2158,9 @@ class ObjectDetectionPanel(wx.Panel):
     def imageOpticalFlow(self):
         pass
 
-class WatershedPanel(wx.Panel):
+class WatershedPanel(AlgorithmPanelBase):
     def __init__(self, parent,):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageWatershed      = wx.Button( self, wx.ID_ANY, _(u"分水岭算法生成白底图"), wx.DefaultPosition, wx.DefaultSize, 0 )
         self.imageWatershedCoins = wx.Button( self, wx.ID_ANY, _(u"分水岭算法分割硬币"), wx.DefaultPosition, wx.DefaultSize, 0 )
@@ -2339,16 +2172,15 @@ class WatershedPanel(wx.Panel):
 
         self.imageWatershed.Bind( wx.EVT_BUTTON, self.imageWatershedBtnClick )
         self.imageWatershedCoins.Bind( wx.EVT_BUTTON, self.imageWatershedCoinsBtnClick )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageWatershedBtnClick( self, event ):
         self.imageWatershedGetWhiteBackground()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageWatershedCoinsBtnClick( self, event ):
         self.imageWatershedCoinsPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageWatershedGetWhiteBackground(self):
@@ -2392,8 +2224,7 @@ class WatershedPanel(wx.Panel):
             bg_mask = (markers == 1) | (markers == -1)
             result[bg_mask] = [255, 255, 255]  # BGR白色
 
-            img_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(result)
 
     def imageWatershedCoinsPro(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -2434,14 +2265,13 @@ class WatershedPanel(wx.Panel):
             img_bgr[markers == -1] = [0, 0, 255]
 
             # 11. 将 BGR 转为 RGB，再用 PIL Image 显示
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(img_bgr)
      
 
-class PyramidPanel(wx.Panel):
+class PyramidPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageGaussianPyramid", "imageLaplusPyramid", "imageLaplacianPyramidReconstruction"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"高斯金字塔)"), _(u"拉普拉斯金字塔"), _(u"从拉普拉斯金字塔重建图像")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"金字塔算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 4, wx.RA_SPECIFY_COLS )
@@ -2452,22 +2282,10 @@ class PyramidPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imagePyramidOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imagePyramidOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageGaussianPyramid() 
-            case 1:
-                self.imageLaplusPyramid()
-            case 2:
-                self.imageLaplacianPyramidReconstruction()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imagePyramidOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def build_gaussian_pyramid(self, img, levels=3):
         """构建高斯金字塔（下采样）"""
         pyramid = [img.copy()]
@@ -2532,7 +2350,7 @@ class PyramidPanel(wx.Panel):
 
             # 3. 转 PIL 
             for i, g_img in enumerate(gaussian_pyr):
-                self.parent_frame.processed_pil_image = self.cv2_to_pil(g_img)
+                self.finish(g_img)
                 logging.info(f"高斯金字塔第{i}层尺寸: {g_img.shape}x{g_img.shape}")
 
     def imageLaplusPyramid(self):
@@ -2547,7 +2365,7 @@ class PyramidPanel(wx.Panel):
 
             # 3. 转 PIL 
             for i, l_img in enumerate(laplacian_pyr):
-                self.parent_frame.processed_pil_image = self.cv2_to_pil(l_img)
+                self.finish(l_img)
                 logging.info(f"拉普拉斯金字塔第{i}层尺寸: {l_img.shape}x{l_img.shape}") 
 
     def imageLaplacianPyramidReconstruction(self):
@@ -2562,13 +2380,13 @@ class PyramidPanel(wx.Panel):
 
             # 3、重建测试
             re_img = self.reconstruct_from_laplacian(laplacian_pyr)
-            self.parent_frame.processed_pil_image = self.cv2_to_pil(re_img)        
+            self.finish(re_img)        
 
 
-class AaffineTransformationPanel(wx.Panel):
+class AaffineTransformationPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageTranslation", "imageRotate", "imageScaling", "imageShear", "imageCombinationTransformation"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"平移"), _(u"旋转"), _(u"缩放"), _(u"错切"), _(u"组合变换")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"仿射变换"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 5, wx.RA_SPECIFY_COLS )
@@ -2579,26 +2397,10 @@ class AaffineTransformationPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageAaffineTransformationOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageAaffineTransformationOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageTranslation()
-            case 1:
-                self.imageRotate()
-            case 2:
-                self.imageScaling()
-            case 3:
-                self.imageShear()
-            case 4:
-                self.imageCombinationTransformation()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageAaffineTransformationOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageTranslation(self):
         pil_img             = self.parent_frame.original_pil_image  
         if pil_img: 
@@ -2612,8 +2414,7 @@ class AaffineTransformationPanel(wx.Panel):
 
         dst = cv2.warpAffine(img_bgr, M, (w, h))
 
-        img_rgb = cv2.cvtColor(dst, cv2.COLOR_BGR2RGB)
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        self.finish(dst)
 
     def rotate_arbitrary(self, img, angle, fill_color=(255, 255, 255)):
         h, w = img.shape[:2]
@@ -2648,8 +2449,7 @@ class AaffineTransformationPanel(wx.Panel):
         # rotated = cv2.warpAffine(img_bgr, M, (w, h))
         rotated = self.rotate_arbitrary(img_bgr, 45)
 
-        img_rgb = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        self.finish(rotated)
 
     def affine_scale(self, img, sx, sy):
         """
@@ -2681,8 +2481,7 @@ class AaffineTransformationPanel(wx.Panel):
 
         img_scaled = self.affine_scale(img_bgr, 2, 2)
 
-        img_rgb = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2RGB)
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        self.finish(img_scaled)
 
     def imageShear(self):
         pil_img             = self.parent_frame.original_pil_image  
@@ -2709,8 +2508,7 @@ class AaffineTransformationPanel(wx.Panel):
                                       flags=cv2.INTER_LINEAR, 
                                       borderMode=cv2.BORDER_CONSTANT, 
                                       borderValue=(255, 255, 255))
-            img_rgb = cv2.cvtColor(sheared, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(sheared)
 
     def combined_affine(self, image, rotate_angle=0, scale=1.0, translate=(0, 0), center=None):
         h, w = image.shape[:2]
@@ -2742,14 +2540,12 @@ class AaffineTransformationPanel(wx.Panel):
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
 
             result,_ = self.combined_affine(img_bgr, 30, 2, (100,100))
-            img_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.finish(result)
 
 
-class PerspectiveTransformationPanel(wx.Panel):
+class PerspectiveTransformationPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imagePerspectiveTransformation      = wx.Button( self, wx.ID_ANY, _(u"透视变换算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.HORIZONTAL )        
@@ -2759,11 +2555,10 @@ class PerspectiveTransformationPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imagePerspectiveTransformation.Bind( wx.EVT_BUTTON, self.imagePerspectiveTransformationBtnClick )        
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imagePerspectiveTransformationBtnClick( self, event ):
         self.imagePerspectiveTransformationPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imagePerspectiveTransformationPro(self):
@@ -2785,14 +2580,13 @@ class PerspectiveTransformationPanel(wx.Panel):
 
             # 5. 执行透视变换，输出尺寸 (width, height)
             warped = cv2.warpPerspective(img_bgr, M, (188, 262))
-            img_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)      
+            self.finish(warped)
 
 
-class FourierTransformationPanel(wx.Panel):
+class FourierTransformationPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageFourierSpectrum", "imageFourierRestored"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"频谱图"), _(u"逆变换原图")]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"傅里叶变换算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 5, wx.RA_SPECIFY_COLS )
@@ -2803,20 +2597,10 @@ class FourierTransformationPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageFourierTransformationOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageFourierTransformationOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageFourierSpectrum()
-            case 1:
-                self.imageFourierRestored()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    def imageFourierTransformationOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
         event.Skip()
-
     def imageFourierSpectrum(self):
         'OpenCV 实现傅里叶变换的核心流程是：读图转灰度 → 转 float32 → cv2.dft() → fftshift 中心化 → 计算幅度谱 → 转 PIL Image'
         """
@@ -2857,7 +2641,7 @@ class FourierTransformationPanel(wx.Panel):
             img_back = np.uint8(img_back)
 
             # 8. 转 PIL Image（OpenCV 是 BGR，单通道灰度图不需要通道转换            
-            self.parent_frame.processed_pil_image = Image.fromarray(magnitude_uint8)  # 频谱图
+            self.finish(magnitude_uint8)  # 频谱图
 
     def imageFourierRestored(self):
         
@@ -2893,12 +2677,11 @@ class FourierTransformationPanel(wx.Panel):
 
             # 8. 转 PIL Image（OpenCV 是 BGR，单通道灰度图不需要通道转换）
             
-            self.parent_frame.processed_pil_image = Image.fromarray(img_back)     # 逆变换还原图
+            self.finish(img_back)     # 逆变换还原图
 
-class FloodFillPanel(wx.Panel):
+class FloodFillPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageFloodFill      = wx.Button( self, wx.ID_ANY, _(u"漫水填充算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.HORIZONTAL )        
@@ -2908,11 +2691,10 @@ class FloodFillPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageFloodFill.Bind( wx.EVT_BUTTON, self.imageFloodFillOnBtnClick )        
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageFloodFillOnBtnClick( self, event ):
         self.imageFloodFillOnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageFloodFillOnBtnClickPro(self):
@@ -2943,12 +2725,12 @@ class FloodFillPanel(wx.Panel):
             cv2.floodFill(img_bgr, mask, seed_point, new_val, lo_diff, up_diff, flags)
 
             # 6. OpenCV BGR -> RGB，再转 PIL Image
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            self.finish(img_bgr)
 
-class RemappingPanel(wx.Panel):
+class RemappingPanel(AlgorithmPanelBase):
+    ALGORITHM_METHODS = ["imageHorizontalMirror", "imageVerticalMirror", "imageFlipAroundXYAxis", "imageCompressYAxisByHalf", "imageCompressXAxisByHalf", "imageCompressEachXAndYAxesByHalf"]
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         m_radioBox2Choices = [ _(u"水平镜像"), _(u"垂直镜像"),_(u"绕XY轴翻转"),_(u"Y轴压缩一半"),_(u"X轴压缩一半"),_(u"XY轴各压缩一半"),]
         self.m_radioBox2 = wx.RadioBox( self, wx.ID_ANY, _(u"重映像算法"), wx.DefaultPosition, wx.Size( 1600,160 ), m_radioBox2Choices, 6, wx.RA_SPECIFY_COLS )
@@ -2959,28 +2741,10 @@ class RemappingPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.m_radioBox2.Bind( wx.EVT_RADIOBOX, self.imageRemappingOnRadioBox )
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件
 
-    def imageRemappingOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageHorizontalMirror()
-            case 1:
-                self.imageVerticalMirror()
-            case 2:
-                self.imageFlipAroundXYAxis()
-            case 3:
-                self.imageCompressYAxisByHalf()
-            case 4:
-                self.imageCompressXAxisByHalf()
-            case 5:
-                self.imageCompressEachXAndYAxesByHalf()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
-        event.Skip()  
-
+    def imageRemappingOnRadioBox( self, event ):
+        self.run_algorithm(self.m_radioBox2.GetSelection())
+        event.Skip()
     def imageHorizontalMirror(self):
         """
         关键说明:
@@ -3028,7 +2792,7 @@ class RemappingPanel(wx.Panel):
             # 3. 应用重映射
             remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
             # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))            
+            self.finish(remapped)
     
     def imageVerticalMirror(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -3062,7 +2826,7 @@ class RemappingPanel(wx.Panel):
             # 3. 应用重映射
             remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
             # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+            self.finish(remapped)
 
     def imageFlipAroundXYAxis(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -3091,7 +2855,7 @@ class RemappingPanel(wx.Panel):
             # 3. 应用重映射
             remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
             # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+            self.finish(remapped)
 
     def imageCompressXAxisByHalf(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -3116,7 +2880,7 @@ class RemappingPanel(wx.Panel):
             # 3. 应用重映射
             remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
             # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+            self.finish(remapped)
 
     def imageCompressYAxisByHalf(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -3141,7 +2905,7 @@ class RemappingPanel(wx.Panel):
             # 3. 应用重映射
             remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
             # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+            self.finish(remapped)
 
     def imageCompressEachXAndYAxesByHalf(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -3166,12 +2930,11 @@ class RemappingPanel(wx.Panel):
             # 3. 应用重映射
             remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
             # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+            self.finish(remapped)
 
-class BackProjectionPanel(wx.Panel):
+class BackProjectionPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageBackProjection      = wx.Button( self, wx.ID_ANY, _(u"反向投影算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.HORIZONTAL )        
@@ -3181,11 +2944,10 @@ class BackProjectionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageBackProjection.Bind( wx.EVT_BUTTON, self.imageBackProjectionOnBtnClick )        
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageBackProjectionOnBtnClick( self, event ):
         self.imageBackProjectionOnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageBackProjectionOnBtnClickPro(self):
@@ -3228,20 +2990,17 @@ class BackProjectionPanel(wx.Panel):
 
             self.parent_frame.processed_pil_image = result_pil
 
-class CameraPanel(wx.Panel):
+class CameraPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
-class CoordinateCalibrationPanel(wx.Panel):
+class CoordinateCalibrationPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
-class OcrPanel(wx.Panel):
+class OcrPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageOcr      = wx.Button( self, wx.ID_ANY, _(u"光学字符识别算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.HORIZONTAL )        
@@ -3251,11 +3010,10 @@ class OcrPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageOcr.Bind( wx.EVT_BUTTON, self.imageOcrOnBtnClick )        
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageOcrOnBtnClick( self, event ):
         self.imageOcrOnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageOcrOnBtnClickPro(self):
@@ -3279,10 +3037,9 @@ class OcrPanel(wx.Panel):
             self.parent_frame.processed_pil_image = Image.fromarray(binary)
 
 
-class VehicleLicensePlateRecognitionPanel(wx.Panel):
+class VehicleLicensePlateRecognitionPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageVLPR      = wx.Button( self, wx.ID_ANY, _(u"车牌号识别算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.HORIZONTAL )        
@@ -3292,11 +3049,10 @@ class VehicleLicensePlateRecognitionPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageVLPR.Bind( wx.EVT_BUTTON, self.imageVLPROnBtnClick )        
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageVLPROnBtnClick( self, event ):
         self.imageVLPROnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def locate_license_plate(self, edged, img):
@@ -3366,10 +3122,9 @@ class VehicleLicensePlateRecognitionPanel(wx.Panel):
 
             self.parent_frame.processed_pil_image = Image.fromarray(result_img)
 
-class QRCodeRecognizationPanel(wx.Panel):
+class QRCodeRecognizationPanel(AlgorithmPanelBase):
     def __init__(self, parent):
         super().__init__(parent)
-        self.parent_frame = parent  # 保存 Frame 引用
 
         self.imageQRCodeRecognization      = wx.Button( self, wx.ID_ANY, _(u"二维码识别算法"), wx.DefaultPosition, wx.DefaultSize, 0 )
         controlPanelSizer = wx.BoxSizer( wx.HORIZONTAL )        
@@ -3379,11 +3134,10 @@ class QRCodeRecognizationPanel(wx.Panel):
         controlPanelSizer.Fit( self )
 
         self.imageQRCodeRecognization.Bind( wx.EVT_BUTTON, self.imageQRCodeRecognizationOnBtnClick )        
-        self.evt = TriggrRightPanelDisplayEvent(myEVT_RIGHT_DISPLAY, self.GetId()) #7 创建自定义事件      
 
     def imageQRCodeRecognizationOnBtnClick( self, event ):
         self.imageQRCodeRecognizationOnPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.fire_display_event()  # 触发事件  
         event.Skip()
 
     def imageQRCodeRecognizationOnPro(self):
@@ -3414,5 +3168,4 @@ class QRCodeRecognizationPanel(wx.Panel):
                 # 显示文字
                 x, y, w, h = obj.rect
                 cv2.putText(img_bgr, data, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,0.7, (0, 255, 0), 2)
-
                 self.parent_frame.processed_pil_image = Image.fromarray(img_bgr)
