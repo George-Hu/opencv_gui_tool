@@ -1,13 +1,24 @@
 # -*- coding: utf-8 -*-
 """控制层（control）—— 事件响应 + OpenCV 算法实现。
 
-包含两部分：
-    1. cvToolControlMixin : 主窗口的菜单/按钮事件（切换面板、打开图片、关于）
-    2. XxxPanel           : 各算法面板的事件处理与算法实现（继承模板层的 XxxPanelTemplate）
+包含三部分：
+    1. 图像转换工具 / 结果回写   —— 文件顶部，所有面板共用
+    2. cvToolControlMixin        —— 主窗口的菜单/按钮事件（切换面板、打开图片、关于）
+    3. XxxPanel                  —— 各算法面板的事件处理与算法实现（继承模板层的 XxxPanelTemplate）
 
 所有算法都从 self.parent_frame 取原图，算完写回 processed_pil_image，
 由视图层负责把结果显示到右侧面板。
+
+约定：
+    * 取图统一用 frame_bgr() / frame_gray()，自带缓存且返回副本，随便改不会污染原图；
+    * 回写统一用 bgr_to_pil()，单通道（灰度/二值）会直接转成 PIL 的 L 模式；
+    * 事件入口加 @safe_process，算法出错只弹窗提示，不会让整个程序退出。
 """
+
+import functools
+import io
+import logging
+import os
 
 import wx
 import wx.adv
@@ -15,19 +26,35 @@ import wx.adv
 import cv2
 import numpy as np
 
-import io
-import logging
-
 import matplotlib
 matplotlib.use('Agg')  # 无 GUI 模式，只画图不弹窗
-import matplotlib.pyplot as plt
-
-import pytesseract
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 
 from PIL import Image
 
 import gettext
 _ = gettext.gettext
+
+# 可选依赖：没装也不影响程序启动，只在真正用到时提示
+try:
+    import pytesseract
+except ImportError:      # pragma: no cover
+    pytesseract = None
+
+# tesseract 可执行文件位置：优先读环境变量，方便换机器
+TESSERACT_CMD = os.environ.get("TESSERACT_CMD", r"D:\Tesseract-OCR\tesseract.exe")
+
+
+def ensure_tesseract():
+    """配置 tesseract 路径，返回是否可用。"""
+    if pytesseract is None:
+        logging.error("未安装 pytesseract，无法进行文字识别")
+        return False
+    if os.path.exists(TESSERACT_CMD):
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+    return True
+
 
 from opencvTool_template import (
     ColorExtractionPanelTemplate,
@@ -64,161 +91,179 @@ from opencvTool_template import (
 
 
 ###########################################################################
+## 图像格式转换工具（PIL <-> OpenCV）：把散落各处的 5 行样板收成 1 行调用
+###########################################################################
+
+
+def pil_to_bgr(pil_img):
+    """PIL 图像 -> OpenCV BGR ndarray。
+
+    先统一 convert("RGB")：P / RGBA / L 模式的图片（GIF、带透明通道的 PNG）
+    直接丢给 cvtColor(RGB2BGR) 会因为通道数不对而报错。
+    """
+    if pil_img is None:
+        return None
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    return cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def pil_to_gray(pil_img):
+    """PIL 图像 -> 单通道灰度 ndarray（直接取 L 通道，比 BGR->GRAY 少一次转换）。"""
+    if pil_img is None:
+        return None
+    return np.asarray(pil_img.convert("L")).copy()
+
+
+def bgr_to_pil(img):
+    """OpenCV 图像 -> PIL 图像。
+
+    单通道（灰度/二值）直接交给 PIL（自动用 L 模式），不需要再 cvtColor 转三通道；
+    3 通道按 BGR->RGB；4 通道按 BGRA->RGBA。
+    """
+    if img is None:
+        return None
+    if img.ndim == 2:
+        return Image.fromarray(img)
+    if img.shape[2] == 4:
+        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA))
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+
+def frame_bgr(frame):
+    """取主窗口原图的 BGR 数组（带缓存，返回副本）。
+
+    每点一次按钮都重新 asarray + cvtColor 一遍整图是纯浪费：原图不换就一直复用。
+    返回副本是为了让算法可以放心地在图上画框、做分水岭等原地修改。
+    """
+    pil_img = getattr(frame, "original_pil_image", None)
+    if pil_img is None:
+        return None
+    cache = getattr(frame, "_bgr_cache", None)
+    if cache is not None and cache[0] is pil_img:
+        return cache[1].copy()
+    bgr = pil_to_bgr(pil_img)
+    frame._bgr_cache = (pil_img, bgr)
+    return bgr.copy()
+
+
+def frame_gray(frame):
+    """取主窗口原图的灰度数组（带缓存，返回副本）。"""
+    pil_img = getattr(frame, "original_pil_image", None)
+    if pil_img is None:
+        return None
+    cache = getattr(frame, "_gray_cache", None)
+    if cache is not None and cache[0] is pil_img:
+        return cache[1].copy()
+    gray = pil_to_gray(pil_img)
+    frame._gray_cache = (pil_img, gray)
+    return gray.copy()
+
+
+def safe_process(fn):
+    """算法入口包装：捕获异常 -> 写日志 + 弹窗，避免一个算法出错整个程序退出。"""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as exc:                      # GUI 里兜住所有异常
+            logging.exception("算法 %s 执行失败", fn.__name__)
+            wx.MessageBox(f"{fn.__name__} 执行失败：\n{exc}",
+                          "算法错误", wx.OK | wx.ICON_ERROR, self)
+            return None
+
+    return wrapper
+
+
+def _get_ximgproc(owner, attr=None):
+    """获取 cv2.ximgproc（contrib 扩展模块）。
+
+    两种损坏场景都会被拦下：
+    1. 装的是纯净版 opencv-python，根本没有 contrib 模块；
+    2. opencv-python 与 opencv-contrib-python 同时安装，cv2.pyd 互相覆盖，
+       此时 cv2.ximgproc 只剩空壳命名空间，具体函数不存在。
+    检测到问题时不抛 AttributeError，而是给出明确的安装指引。
+    """
+    ximgproc = getattr(cv2, "ximgproc", None)
+    if ximgproc is None or (attr is not None and not hasattr(ximgproc, attr)):
+        logging.error("OpenCV contrib 模块不可用（缺少 %s）", attr or "cv2.ximgproc")
+        wx.MessageBox(
+            "当前环境缺少 OpenCV contrib 扩展模块。\n\n"
+            "FastLineDetector / EdgeDrawing 等算法需要扩展版，且"
+            "opencv-python 与 opencv-contrib-python 只能装一个：\n"
+            "    pip uninstall opencv-python opencv-contrib-python\n"
+            "    pip install opencv-contrib-python",
+            "缺少依赖模块", wx.OK | wx.ICON_WARNING, owner)
+        return None
+    return ximgproc
+
+
+###########################################################################
 ## 主窗口事件控制
 ###########################################################################
 
+
 class cvToolControlMixin:
-    """主窗口的事件响应：菜单切换面板、打开图片、关于对话框。"""
+    """主窗口的事件响应：菜单切换面板、打开图片、关于对话框。
 
-    def color_extraction_panel( self, event ): 
+    28 个 *_panel 菜单方法长得一模一样，这里只留一个 _switch_panel，
+    其余由下面的 _PANEL_SWITCH_TABLE 表驱动生成（方法名保持不变，
+    wxFormBuilder 生成的 self.color_extraction_panel 之类的绑定照旧生效）。
+    """
+
+    def _switch_panel(self, panel_name, show_example=False, example_label=None, event=None):
+        """切到指定面板，并决定「打开示例图」按钮是否可见。"""
+        self.exampleImage.Show(show_example)
+        if example_label:
+            self.exampleImage.SetLabel(example_label)
+        self.switch_panel(getattr(self, panel_name))
+        if event is not None:
+            event.Skip()
+
+    def _load_image(self, title, display_flag, is_original):
+        """打开图片对话框 + 载入 + 显示：原图与对比图共用一套流程，返回是否成功。"""
+        wildcard = ("图片文件 (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp;*.tif)"
+                    "|*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp;*.tif")
+        with wx.FileDialog(self, title, wildcard=wildcard,
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return False
+            filepath = dlg.GetPath()
+
+        # 用 with 关掉文件句柄，否则 Windows 下图片会被一直占用
+        with Image.open(filepath) as im:
+            pil_img = im.convert("RGB")
+
+        self.filepath = filepath
+        if is_original:
+            self.original_pil_image = pil_img
+            self._bgr_cache = None      # 换了原图，缓存失效
+            self._gray_cache = None
+        else:
+            self.processed_pil_image = pil_img
+
+        self.display_image(pil_img, display_flag)
+        self._refresh_image_info()
+        return True
+
+    def _refresh_image_info(self):
+        """刷新底部「原图 / 处理后」尺寸提示。"""
+        original = self.original_pil_image
+        if original is None:
+            return
+        processed = self.processed_pil_image
+        if processed is None:
+            self.imageInfoStaticText.SetLabel(f"原图: {original.width}x{original.height}px")
+        else:
+            self.imageInfoStaticText.SetLabel(
+                f"原图: {original.width}x{original.height}px -> "
+                f"处理后: {processed.width}x{processed.height}px")
+        self.Layout()
+
+    def about_panel(self, event):
         self.exampleImage.Hide()
 
-        self.switch_panel(self.colorExtractionPanel)
-        event.Skip()
-
-    def image_difference_panel( self, event ):
-        self.exampleImage.Show()
-        self.exampleImage.SetLabel("打开对比图")
-
-        self.switch_panel(self.imageDifferencePanel)
-        event.Skip()
-
-    def image_stitching_panel( self, event ):
-        self.exampleImage.Show()
-        self.exampleImage.SetLabel("打开拼接图")        
-
-        self.switch_panel(self.imageStitchingPanel)
-        event.Skip()
-
-    def histogram_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageHistogramPanel)
-        event.Skip()
-
-    def color_space_and_channel_extraction_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageColorSpaceAndChannelExtractionPanel)
-        event.Skip()
-
-    def equalization_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageEqualizationPanel)
-        event.Skip()
-
-    def threshold_processing_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageThresholdProcessingPanel)
-        event.Skip()
-
-    def filtering_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageFilteringPanel)
-        event.Skip()
-
-    def morphological_operation_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageMorphologicalOperationPanel)
-        event.Skip()
-
-    def ROI_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageROIPanel)
-        event.Skip()
-
-    def corner_detection_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageCornerDetectionPanel)
-        event.Skip()
-
-    def edge_detection_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageEdgeDetectionPanel)
-        event.Skip()
-
-    def geometric_shape_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageGeometricShapePanel)
-        event.Skip()
-
-    def moving_object_detection_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageMovingObjectDetectionPanel)
-        event.Skip()
-
-    def object_detection_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageObjectDetectionPanel)
-        event.Skip()
-
-    def watershed_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageWatershedPanel)
-        event.Skip()
-
-    def pyramid_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imagePyramidPanel)
-        event.Skip()
-
-    def affine_transformation_panel( self, event ): 
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageAaffineTransformationPanel)
-        event.Skip()
-
-    def perspective_transformation_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imagePerspectiveTransformationPanel)
-        event.Skip()
-
-    def fourier_transformation_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageFourierTransformationPanel)
-        event.Skip()
-
-    def flood_fill_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageFloodFillPanel)
-        event.Skip()
-
-    def remapping_panel( self, event ):
-        self.exampleImage.Hide()        
-        self.switch_panel(self.imageRemappingPanel)
-        event.Skip()
-
-    def back_projection_panel( self, event ):
-        self.exampleImage.Show()
-        self.exampleImage.SetLabel("打开目标图片")        
-        
-        self.switch_panel(self.imageBackProjectionPanel)
-        event.Skip()
-
-    def camera_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageCameraPanel)
-        event.Skip()
-
-    def coordinate_calibration_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageCoordinateCalibrationPanel)
-        event.Skip()
-
-    def ocr_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageOcrPanel)
-        event.Skip()
-
-    def vehicle_license_plate_recognition_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageVehicleLicensePlateRecognitionPanel)
-        event.Skip()
-
-    def QR_code_recognization_panel( self, event ):
-        self.exampleImage.Hide()
-        self.switch_panel(self.imageQRCodeRecognizationPanel)
-        event.Skip()
-
-    def about_panel( self, event ):
-        self.exampleImage.Hide()
         info = wx.adv.AboutDialogInfo()
         info.SetName("HQQ's wxPython Program")
         info.SetVersion("1.0")
@@ -230,1052 +275,723 @@ class cvToolControlMixin:
         info.AddDocWriter("Hu QiQiao")
         info.AddArtist("Hu QiQiao")
         info.AddTranslator("Hu QiQiao")
-        
+
         wx.adv.AboutBox(info)
         event.Skip()
 
-    def openImageclick ( self, event ):
-        logging.info("""打开图片和重新打开图片处理""")
-        # 弹出文件选择对话框
-        with wx.FileDialog(self, "选择图片", wildcard="图片文件 (*.jpg;*.png;*.bmp;*.gif)|*.jpg;*.png;*.bmp;*.gif",
-                          style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                self.filepath = dlg.GetPath() 
-                self.original_pil_image = Image.open(self.filepath)  # PIL image          
-                self.display_image(self.original_pil_image, 0)
-                self.imageInfoStaticText.SetLabel(f"原图: {self.original_pil_image.width}x{self.original_pil_image.height}")
-                self.openImage.SetLabelMarkup( _(u"再次上传图片") )
+    def openImageclick(self, event):
+        logging.info("打开图片/重新打开图片处理")
+        if self._load_image("选择图片", 0, is_original=True):
+            self.openImage.SetLabelMarkup(_(u"再次上传图片"))
         event.Skip()
 
-    def exampleImageClick ( self, event ):
-        logging.info("""打开示例图片和重新打开图片处理""")
-        # 弹出文件选择对话框
-        with wx.FileDialog(self, "选择图片", wildcard="图片文件 (*.jpg;*.png;*.bmp;*.gif)|*.jpg;*.png;*.bmp;*.gif",
-                          style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                self.filepath = dlg.GetPath() 
-                self.processed_pil_image = Image.open(self.filepath)   # PIL image
-                self.display_image(self.processed_pil_image, 1)
-                self.imageInfoStaticText.SetLabel(f"原图: {self.original_pil_image.width}x{self.original_pil_image.height} \
-                   使用函数: {self.used_function}   处理后: {self.processed_pil_image.width}x{self.processed_pil_image.height}")           
+    def exampleImageClick(self, event):
+        logging.info("打开示例图片/对比图片处理")
+        self._load_image("选择图片", 1, is_original=False)
         event.Skip()
+
+
+# 菜单方法名 -> (面板属性名, 「打开示例图」按钮是否可见, 按钮文字)
+_PANEL_SWITCH_TABLE = {
+    "color_extraction_panel":                    ("colorExtractionPanel",                          False, None),
+    "image_difference_panel":                    ("imageDifferencePanel",                          True,  "打开对比图"),
+    "image_stitching_panel":                     ("imageStitchingPanel",                           True,  "打开拼接图"),
+    "histogram_panel":                           ("imageHistogramPanel",                           False, None),
+    "color_space_and_channel_extraction_panel":  ("imageColorSpaceAndChannelExtractionPanel",      False, None),
+    "equalization_panel":                        ("imageEqualizationPanel",                        False, None),
+    "threshold_processing_panel":                ("imageThresholdProcessingPanel",                  False, None),
+    "filtering_panel":                           ("imageFilteringPanel",                           False, None),
+    "morphological_operation_panel":             ("imageMorphologicalOperationPanel",              False, None),
+    "ROI_panel":                                 ("imageROIPanel",                                 False, None),
+    "corner_detection_panel":                    ("imageCornerDetectionPanel",                     False, None),
+    "edge_detection_panel":                      ("imageEdgeDetectionPanel",                       False, None),
+    "geometric_shape_panel":                     ("imageGeometricShapePanel",                      False, None),
+    "moving_object_detection_panel":             ("imageMovingObjectDetectionPanel",               False, None),
+    "object_detection_panel":                    ("imageObjectDetectionPanel",                     False, None),
+    "watershed_panel":                           ("imageWatershedPanel",                           False, None),
+    "pyramid_panel":                             ("imagePyramidPanel",                             False, None),
+    "affine_transformation_panel":               ("imageAaffineTransformationPanel",               False, None),
+    "perspective_transformation_panel":          ("imagePerspectiveTransformationPanel",           False, None),
+    "fourier_transformation_panel":              ("imageFourierTransformationPanel",               False, None),
+    "flood_fill_panel":                          ("imageFloodFillPanel",                           False, None),
+    "remapping_panel":                           ("imageRemappingPanel",                           False, None),
+    "back_projection_panel":                     ("imageBackProjectionPanel",                      True,  "打开目标图片"),
+    "camera_panel":                              ("imageCameraPanel",                              False, None),
+    "coordinate_calibration_panel":              ("imageCoordinateCalibrationPanel",               False, None),
+    "ocr_panel":                                 ("imageOcrPanel",                                 False, None),
+    "vehicle_license_plate_recognition_panel":   ("imageVehicleLicensePlateRecognitionPanel",      False, None),
+    "QR_code_recognization_panel":               ("imageQRCodeRecognizationPanel",                 False, None),
+}
+
+
+def _make_panel_handler(panel_name, show_example, example_label):
+    """生成一个菜单回调，行为等价于原来手写的 xxx_panel 方法。"""
+
+    def handler(self, event):
+        self._switch_panel(panel_name, show_example, example_label, event)
+
+    handler.__name__ = "panel_handler"
+    return handler
+
+
+for _method_name, (_panel, _show, _label) in _PANEL_SWITCH_TABLE.items():
+    setattr(cvToolControlMixin, _method_name, _make_panel_handler(_panel, _show, _label))
 
 
 ###########################################################################
 ## 各算法面板：事件处理 + 算法实现
 ###########################################################################
 
+
 class ColorExtractionPanel(ColorExtractionPanelTemplate):
     """ColorExtractionPanel 的事件处理与算法实现。"""
 
-    def imageProcessOnRadioBox( self, event ):
-        if self.m_radioBox2.GetSelection() == 0:
-            self.imageProcessBGR2GRAY()
-            pass
-        elif self.m_radioBox2.GetSelection() == 1: 
-            self.imageProcessBGR2HSV() 
-            pass
-        elif self.m_radioBox2.GetSelection() == 2:
-            self.imageProcessRGB2BGR()
-            pass
-        elif self.m_radioBox2.GetSelection() == 3:
-            self.imageProcessBGR2YCrCb()
+    # 单选序号 -> 方法名，新增算法只在表里加一项
+    _HANDLERS = ("imageProcessBGR2GRAY", "imageProcessBGR2HSV",
+                 "imageProcessRGB2BGR", "imageProcessBGR2YCrCb")
+
+    @safe_process
+    def imageProcessOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
         else:
-            print("error")
-            event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+            logging.warning("未知的色彩空间选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
-    def imageProcessBGR2GRAY( self ):  
-        pil_img =self.parent_frame.original_pil_image       
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+    def _set_result(self, img, as_bgr=True):
+        """把 OpenCV 结果写回主窗口（as_bgr=False 表示直接把数组交给 PIL）。"""
+        self.parent_frame.processed_pil_image = bgr_to_pil(img) if as_bgr else Image.fromarray(img)
 
-            # 2、 Convert BGR to GRAY
-            gray_img            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)            
+    def imageProcessBGR2GRAY(self):
+        """BGR -> 灰度（再转回三通道，右侧面板显示灰度效果）"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        self._set_result(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
 
-            # 3. Convert GRAY to BGR（转回才能正常显示或保存）
-            img_bgr_new         = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
+    def imageProcessBGR2HSV(self):
+        """BGR -> HSV 后按阈值提取黄色区域，其余部分变黑。
 
-            # 4. Conert BGR to RGB（PIL 需要 RGB 顺序）
-            img_rgb             = cv2.cvtColor(img_bgr_new, cv2.COLOR_BGR2RGB)
+        注意：bitwise_and 的输出已经是 BGR 图像，别再拿 HSV2BGR 去转它。
+        """
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        # 黄色的 HSV 范围：H 20~40，S/V 下限 50 可以压掉灰色干扰
+        lower_yellow = np.array([20, 50, 50])
+        upper_yellow = np.array([40, 255, 255])
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+        self._set_result(cv2.bitwise_and(img_bgr, img_bgr, mask=mask))
 
-            # 5. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+    def imageProcessRGB2BGR(self):
+        """通道顺序对调演示：把 BGR 数组直接当成 RGB 显示，红蓝互换"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        self._set_result(img_bgr, as_bgr=False)
 
-    def imageProcessBGR2HSV( self ):
-        """OpenCV 的 cv2.imread() 读取结果是 numpy.ndarray 数组，
-           PIL 的 Image.open() 返回的是 PIL.Image.Image 对象，
-           两者互转的关键是颜色通道顺序不同：OpenCV 默认是 BGR，
-           PIL 是 RGB。转换时需用 cv2.cvtColor() 调整通道顺序，
-           再用 np.asarray() 或 Image.fromarray() 做格式切换"""
-        pil_img = self.parent_frame.original_pil_image     # <PIL.PngImagePlugin.PngImageFile image mode=RGB size=750x437 at 0x2CCC8D71C70>
-        # type(pil_img) # <class 'PIL.PngImagePlugin.PngImageFile'>
+    def imageProcessBGR2YCrCb(self):
+        """BGR -> YCrCb -> 再转回 BGR（两次转换后颜色应与原图基本一致）"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+        self._set_result(cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR))
 
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-
-            # 2、 Convert BGR to HSV
-            hsv_img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-            # 3、 做HSV通道调整
-            # define range of yellow color in HSV
-            # 定义黄色的HSV阈值范围
-            # 
-            # 参数         初始范围    优化建议
-            # H（色调）    [20, 40]    根据环境光线动态调整
-            # S（饱和度）  [50, 255]   提高下限以减少干扰
-            # V（亮度）    [50, 255]   结合实际场景调整上限和下限
-            lower_yellow = np.array([20, 50, 50])
-            upper_yellow = np.array([40, 255, 255])
-
-            # 4、 Threshold the HSV image to get only blue colors
-            mask                = cv2.inRange(hsv_img, lower_yellow, upper_yellow)
-
-            # 5、 Bitwise-AND mask and original image
-            processed_hsv_img   = cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
-
-            # 6. Convert HSV to BGR（转回才能正常显示或保存）
-            img_bgr_new         = cv2.cvtColor(processed_hsv_img, cv2.COLOR_HSV2BGR)
-
-            # 7. Conert BGR to RGB（PIL 需要 RGB 顺序）
-            img_rgb             = cv2.cvtColor(img_bgr_new, cv2.COLOR_BGR2RGB)
-
-            # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
-
-    def imageProcessRGB2BGR( self ):
-        pil_img = self.parent_frame.original_pil_image        
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-
-            # 2. BGR 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.processed_pil_image = Image.fromarray(img_bgr)
-
-    def imageProcessBGR2YCrCb( self ):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-
-            # 2、 Convert BGR to GRAY
-            gray_img    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
-
-            # 3. Convert GRAY to BGR（转回才能正常显示或保存）
-            img_bgr_new = cv2.cvtColor(gray_img, cv2.COLOR_BGR2YCrCb)
-
-            # 4. Conert BGR to RGB（PIL 需要 RGB 顺序）
-            img_rgb     = cv2.cvtColor(img_bgr_new, cv2.COLOR_BGR2RGB)
-
-            # 5. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
 
 class ImageDifferencePanel(ImageDifferencePanelTemplate):
     """ImageDifferencePanel 的事件处理与算法实现。"""
 
-    def imageDiffBtnClick( self, event ):
+    SIZE = (800, 600)   # 两张图统一尺寸后才能逐像素相减
+
+    @safe_process
+    def imageDiffBtnClick(self, event):
         self.imageProcessDiff()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
-    def imageProcessDiff( self ):
-        # 对比图片尺寸统一转为 800 x 600大小
-        pil_img_1 = self.parent_frame.original_pil_image.resize((800, 600), Image.LANCZOS)
-        pil_img_2 = self.parent_frame.processed_pil_image.resize((800, 600), Image.LANCZOS)
+    def imageProcessDiff(self):
+        frame = self.parent_frame
+        if frame.original_pil_image is None or frame.processed_pil_image is None:
+            wx.MessageBox("请先在左侧打开原图，再点「打开对比图」选择第二张图片。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
 
-        # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-        pil_img_1_bgr = cv2.cvtColor(np.asarray(pil_img_1), cv2.COLOR_RGB2BGR)
-        pil_img_2_bgr = cv2.cvtColor(np.asarray(pil_img_2), cv2.COLOR_RGB2BGR)
+        img_1 = pil_to_bgr(frame.original_pil_image.resize(self.SIZE, Image.LANCZOS))
+        img_2 = pil_to_bgr(frame.processed_pil_image.resize(self.SIZE, Image.LANCZOS))
+        gray_1 = cv2.cvtColor(img_1, cv2.COLOR_BGR2GRAY)
+        gray_2 = cv2.cvtColor(img_2, cv2.COLOR_BGR2GRAY)
 
-        # 2、 Convert BGR to GRAY
-        gray_img_1   = cv2.cvtColor(pil_img_1_bgr, cv2.COLOR_BGR2GRAY) 
-        gray_img_2   = cv2.cvtColor(pil_img_2_bgr, cv2.COLOR_BGR2GRAY) 
+        diff = cv2.absdiff(gray_1, gray_2)
+        self.parent_frame.processed_pil_image = bgr_to_pil(diff)   # 单通道直接交给 PIL
 
-        diff = cv2.absdiff(gray_img_1, gray_img_2)
-        # 3. Convert GRAY to BGR（转回才能正常显示或保存）
-        diff_new    = cv2.cvtColor(diff, cv2.COLOR_GRAY2BGR) 
-        img_rgb     = cv2.cvtColor(diff_new, cv2.COLOR_BGR2RGB)
-
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
 
 class ImageStitchingPanel(ImageStitchingPanelTemplate):
     """ImageStitchingPanel 的事件处理与算法实现。"""
 
-    def imageStitchBtnClick( self, event ):
+    SIZE = (800, 600)
+
+    @safe_process
+    def imageStitchBtnClick(self, event):
         self.imageProcessStitch()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
-    def imageProcessStitch( self ):
-        pil_img_1 = self.parent_frame.original_pil_image.resize((800, 600), Image.LANCZOS)
-        pil_img_2 = self.parent_frame.processed_pil_image.resize((800, 600), Image.LANCZOS)
+    def imageProcessStitch(self):
+        frame = self.parent_frame
+        if frame.original_pil_image is None or frame.processed_pil_image is None:
+            wx.MessageBox("请先在左侧打开原图，再点「打开拼接图」选择第二张图片。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
 
-        # PANORAMA模式:适合手持相机围绕光心旋转拍摄的风景、室内大场景，内部会按全景模型校正畸变并做球面或柱面投影。
-        # SCANS模式:   适合文档扫描、平面物体平行移动拍摄，内部主要做平面仿射拼接，不会强行做球面投影。
+        img_1 = pil_to_bgr(frame.original_pil_image.resize(self.SIZE, Image.LANCZOS))
+        img_2 = pil_to_bgr(frame.processed_pil_image.resize(self.SIZE, Image.LANCZOS))
+
+        # PANORAMA 模式：适合手持相机围绕光心旋转拍摄的风景、室内大场景
+        # SCANS 模式   ：适合文档扫描、平面物体平行移动拍摄（只做平面仿射拼接）
         stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
-
-         # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-        pil_img_1_bgr = cv2.cvtColor(np.asarray(pil_img_1), cv2.COLOR_RGB2BGR)
-        pil_img_2_bgr = cv2.cvtColor(np.asarray(pil_img_2), cv2.COLOR_RGB2BGR)
-
-        # 执行拼接，返回状态码和结果 
-        # nano 返回的是 numpy.ndarray格式图片数据
-        status, pano = stitcher.stitch([pil_img_1_bgr, pil_img_2_bgr])
+        status, pano = stitcher.stitch([img_1, img_2])
 
         if status == cv2.Stitcher_OK:
             logging.info("拼接成功!")
-            # 先转numpy数组，再BGR -> RGB
-            pano_rgb = cv2.cvtColor(np.asarray(pano), cv2.COLOR_BGR2RGB)
-            # RGB -> PIL Image
-            self.parent_frame.processed_pil_image = Image.fromarray(pano_rgb)
-            logging.info(self.parent_frame.processed_pil_image)
+            frame.processed_pil_image = bgr_to_pil(pano)
         else:
-            logging.error(f"拼接失败，错误码：{status}")
+            logging.error("拼接失败，错误码：%s", status)
+            wx.MessageBox(f"拼接失败，错误码：{status}\n（两张图重叠区域不足时容易失败）",
+                          "拼接失败", wx.OK | wx.ICON_WARNING, self)
+
 
 class HistogramPanel(HistogramPanelTemplate):
     """HistogramPanel 的事件处理与算法实现。"""
 
-    def imageHistBtnClick( self, event):
-        self.imageProcessHist()        
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    @safe_process
+    def imageHistBtnClick(self, event):
+        self.imageProcessHist()
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
-    def imageProcessHist( self ):
-        pil_img = self.parent_frame.original_pil_image        
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+    def imageProcessHist(self):
+        """用 Matplotlib 画三通道直方图。
 
-            # 2. 用 Matplotlib 画三通道直方图
-            fig, ax = plt.subplots(figsize=(8, 5))
-            colors = ('r', 'g', 'b')
-            for i, color in enumerate(colors):
-                ax.hist(img_bgr[:, :, i].flatten(), bins=256, 
-                        range=(0, 256), color=color, alpha=0.5, label=f'{color.upper()} channel')
-            ax.set_xlim(0, 255)
-            ax.set_xlabel('Pixel Value')
-            ax.set_ylabel('Frequency')
-            ax.set_title('RGB Histogram')
-            ax.legend()
-            
-            # 3. 把直方图保存到内存缓冲区，不落盘
-            buf = io.BytesIO()
-            fig.savefig(buf, format='PNG', dpi=100, bbox_inches='tight')
-            plt.close(fig)
+        用 Figure + FigureCanvasAgg 而不是 pyplot：pyplot 会维护全局画布，
+        多次调用容易泄漏 figure，也不用再手动 plt.close()。
+        """
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+
+        fig = Figure(figsize=(8, 5), dpi=100)
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
+        for i, (color, name) in enumerate((("r", "R"), ("g", "G"), ("b", "B"))):
+            ax.hist(img_bgr[:, :, i].ravel(), bins=256, range=(0, 256),
+                    color=color, alpha=0.5, label=f"{name} channel")
+        ax.set_xlim(0, 255)
+        ax.set_xlabel("Pixel Value")
+        ax.set_ylabel("Frequency")
+        ax.set_title("RGB Histogram")
+        ax.legend()
+
+        # 画到内存缓冲区，不落盘
+        with io.BytesIO() as buf:
+            fig.savefig(buf, format="PNG", bbox_inches="tight")
             buf.seek(0)
-            
-            # 4. 用 PIL 打开缓冲区里的直方图图片
-            self.parent_frame.processed_pil_image = Image.open(buf).copy()
+            with Image.open(buf) as im:
+                self.parent_frame.processed_pil_image = im.convert("RGB")
+
 
 class ColorSpaceAndChannelExtractionPanel(ColorSpaceAndChannelExtractionPanelTemplate):
     """ColorSpaceAndChannelExtractionPanel 的事件处理与算法实现。"""
 
-    def imageProcessChannelExtraction( self, event ):              
-        if self.m_radioBox2.GetSelection() == 0:
-            self.imageProcessBGR2B()
-        elif self.m_radioBox2.GetSelection() == 1: 
-            self.imageProcessBGR2G() 
-        elif self.m_radioBox2.GetSelection() == 2:
-            self.imageProcessBGR2R()
-        elif self.m_radioBox2.GetSelection() == 3:
-            self.imageProcessHSV2H()
-        elif self.m_radioBox2.GetSelection() == 4:
-            self.imageProcessHSV2S()
-        elif self.m_radioBox2.GetSelection() == 5:
-            self.imageProcessHSV2V()
+    _HANDLERS = ("imageProcessBGR2B", "imageProcessBGR2G", "imageProcessBGR2R",
+                 "imageProcessHSV2H", "imageProcessHSV2S", "imageProcessHSV2V")
+
+    @safe_process
+    def imageProcessChannelExtraction(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
         else:
-            print("error")
-            event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+            logging.warning("未知的通道选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
+    def _show_channel(self, space, index):
+        """取 BGR 或 HSV 空间的第 index 个通道显示（单通道直接交给 PIL）。"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        source = img_bgr if space == "BGR" else cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        self.parent_frame.processed_pil_image = bgr_to_pil(cv2.split(source)[index])
+
     def imageProcessBGR2B(self):
-        pil_img = self.parent_frame.original_pil_image    # <PIL.PngImagePlugin.PngImageFile image mode=RGB size=750x437 at 0x2CCC8D71C70>
-        # type(pil_img) # <class 'PIL.PngImagePlugin.PngImageFile'>
+        self._show_channel("BGR", 0)
 
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            
-            b,g,r = cv2.split(img_bgr)            
-
-            # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.processed_pil_image = Image.fromarray(b)
-
-    def imageProcessBGR2G(self):       
-        pil_img = self.parent_frame.original_pil_image    # <PIL.PngImagePlugin.PngImageFile image mode=RGB size=750x437 at 0x2CCC8D71C70>
-        # type(pil_img) # <class 'PIL.PngImagePlugin.PngImageFile'>
-
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            
-            b,g,r = cv2.split(img_bgr)            
-
-            # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(g)
+    def imageProcessBGR2G(self):
+        self._show_channel("BGR", 1)
 
     def imageProcessBGR2R(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 1、PIL 转 OpenCV：先转numpy数组，再 BGR 转 RGB
-            img_bgr = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            
-            b,g,r   = cv2.split(img_bgr)
-
-            # 8. 转为 PIL Image 格式，右侧面板显示算法转换后的结果，这里准备显示数据
-            self.parent_frame.processed_pil_image = Image.fromarray(r)
+        self._show_channel("BGR", 2)
 
     def imageProcessHSV2H(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:        
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            hsv_img         = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-            h,s,v           = cv2.split(hsv_img)
-            self.parent_frame.processed_pil_image = Image.fromarray(h)
+        self._show_channel("HSV", 0)
 
     def imageProcessHSV2S(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:        
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            hsv_img         = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-            h,s,v           = cv2.split(hsv_img)
-            self.parent_frame.processed_pil_image = Image.fromarray(s)
+        self._show_channel("HSV", 1)
 
     def imageProcessHSV2V(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:        
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            hsv_img             = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-            h,s,v               = cv2.split(hsv_img)
-            self.parent_frame.processed_pil_image = Image.fromarray(v)
+        self._show_channel("HSV", 2)
+
 
 class EqualizationPanel(EqualizationPanelTemplate):
     """EqualizationPanel 的事件处理与算法实现。"""
 
-    def imageEqualizationBtnClick( self, event ):
+    @safe_process
+    def imageEqualizationBtnClick(self, event):
         self.imageProcessEqualization()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def imageProcessEqualization(self):
-        '''全局均衡化算法'''        
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_yuv             = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
-            img_yuv[:,:,0]      = cv2.equalizeHist(img_yuv[:,:,0]) # 只处理Y亮度通道
-            img_yuv_bgr         = cv2.cvtColor(img_yuv, cv2.COLOR_YCrCb2BGR)
-            img_rgb             = cv2.cvtColor(img_yuv_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """全局直方图均衡化：只在 YCrCb 的 Y（亮度）通道上做，避免偏色。"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        img_ycrcb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+        img_ycrcb[:, :, 0] = cv2.equalizeHist(img_ycrcb[:, :, 0])
+        self.parent_frame.processed_pil_image = bgr_to_pil(
+            cv2.cvtColor(img_ycrcb, cv2.COLOR_YCrCb2BGR))
+
+
+###########################################################################
+## 阈值分割的自定义算法
+## （原来写在各方法的嵌套函数里，每次点击都会重新定义一遍，挪到模块级）
+###########################################################################
+
+
+def iterative_threshold(gray, tolerance=1, max_iter=100):
+    """迭代阈值法：用「前景均值 + 背景均值」的一半不断逼近，直到变化小于容差。"""
+    T = float(np.mean(gray))
+    for _ in range(max_iter):
+        foreground = gray[gray >= T]
+        background = gray[gray < T]
+        if foreground.size == 0 or background.size == 0:   # 某一类为空，提前结束
+            break
+        new_T = (float(np.mean(foreground)) + float(np.mean(background))) / 2.0
+        converged = abs(new_T - T) < tolerance
+        T = new_T
+        if converged:
+            break
+    return int(T)
+
+
+def niblack_threshold(gray, window_size=25, k=-0.2):
+    """Niblack：阈值曲面 = 局部均值 + k * 局部标准差。"""
+    f = gray.astype(np.float32)
+    mean = cv2.blur(f, (window_size, window_size))
+    mean_sq = cv2.blur(f ** 2, (window_size, window_size))
+    std = np.sqrt(np.maximum(mean_sq - mean ** 2, 0))
+    # cv2.blur 默认 BORDER_REFLECT，边界不会越界，不必手动补边
+    return ((f > mean + k * std).astype(np.uint8)) * 255
+
+
+def sauvola_threshold(gray, window_size=25, k=0.2, r=128):
+    """Sauvola：在 Niblack 基础上引入动态范围 R，对光照不均更鲁棒。"""
+    f = gray.astype(np.float32)
+    mean = cv2.blur(f, (window_size, window_size))
+    mean_sq = cv2.blur(f ** 2, (window_size, window_size))
+    std = np.sqrt(np.maximum(mean_sq - mean ** 2, 0))
+    threshold = mean * (1 + k * (std / r - 1))
+    return ((f > threshold).astype(np.uint8)) * 255
+
+
+def max_entropy_threshold(gray):
+    """最大熵法（MEM）：取「背景熵 + 前景熵」最大的那个灰度作为阈值。"""
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    total = hist.sum()
+    if total <= 0:
+        return 127
+    prob = hist / total
+    cum = np.cumsum(prob)
+    best_threshold, best_entropy = 0, -1.0
+    for t in range(1, 256):
+        sum_b, sum_f = cum[t - 1], 1.0 - cum[t - 1]
+        if sum_b <= 0 or sum_f <= 0:
+            continue
+        p_b = prob[:t]
+        p_f = prob[t:]
+        p_b = p_b[p_b > 0] / sum_b
+        p_f = p_f[p_f > 0] / sum_f
+        entropy = -(p_b * np.log2(p_b)).sum() - (p_f * np.log2(p_f)).sum()
+        if entropy > best_entropy:
+            best_entropy, best_threshold = entropy, t
+    return best_threshold
+
+
+def multi_threshold(gray, thresholds=(60, 120, 180), values=(0, 85, 170, 255)):
+    """多阈值分层：按阈值把灰度切成若干段，每段映射成一个固定灰度值。"""
+    if len(values) != len(thresholds) + 1:
+        raise ValueError("values 的个数必须比 thresholds 多 1")
+    result = np.zeros_like(gray)
+    bounds = (0,) + tuple(thresholds) + (256,)
+    for i, value in enumerate(values):
+        lo, hi = bounds[i], bounds[i + 1]
+        result[(gray >= lo) & (gray < hi)] = value
+    return result
+
 
 class ThresholdProcessingPanel(ThresholdProcessingPanelTemplate):
-    """ThresholdProcessingPanel 的事件处理与算法实现。"""
+    """ThresholdProcessingPanel 的事件处理与算法实现。
 
-    def imageThresholdOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageThresBINARY()
-            case 1:
-                self.imageThresBINARYINV()
-            case 2:
-                self.imageThresTRUNC()
-            case 3:
-                self.imageThresTOZERO()
-            case 4:
-                self.imageThresTOZEROINV()
-            case 5:
-                self.imageThresMEANC()
-            case 6:
-                self.imageThresGAUSSIANC()
-            case 7:
-                 self.imageThresOtsu() 
-            case 8:
-                self.imageThresTriangle()
-            case 9:
-                self.imageThresIterative()
-            case 10:
-                self.imageThresNiblack()
-            case 11:
-                self.imageThresSauvola()
-            case 12:
-                self.imageThresMEM()
-            case 13:
-                self.imageThresMultiDomainSegmentation()
-            case _:        
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    13 种阈值方法共用同一套骨架（取灰度 -> 求阈值 -> 二值化 -> 回写），
+    差别只在 OpenCV 的 flag 或自定义算法的几行，所以抽出 _global_threshold /
+    _adaptive_threshold 两个工具，每种算法压缩成一行声明。
+    """
+
+    # 单选序号 -> 方法名，新增算法只需在末尾追加
+    _HANDLERS = (
+        "imageThresBINARY", "imageThresBINARYINV", "imageThresTRUNC",
+        "imageThresTOZERO", "imageThresTOZEROINV", "imageThresMEANC",
+        "imageThresGAUSSIANC", "imageThresOtsu", "imageThresTriangle",
+        "imageThresIterative", "imageThresNiblack", "imageThresSauvola",
+        "imageThresMEM", "imageThresMultiDomainSegmentation",
+    )
+
+    @safe_process
+    def imageThresholdOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的阈值选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
-    def imageThresBINARY(self):
-        '''黑字白底阈值算法'''        
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_BINARY)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+    # ---------------- 公共骨架 ----------------
+    def _set_binary(self, binary):
+        """二值图/灰度图直接交给 PIL（L 模式），不需要再 cvtColor 转三通道。"""
+        self.parent_frame.processed_pil_image = bgr_to_pil(binary)
 
-    def imageThresBINARYINV(self):        
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_BINARY_INV)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+    def _global_threshold(self, thresh_type, thresh=127, maxval=255):
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        _, binary = cv2.threshold(gray, thresh, maxval, thresh_type)
+        self._set_binary(binary)
+
+    def _adaptive_threshold(self, method, block_size=5, c=0):
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        binary = cv2.adaptiveThreshold(gray, 255, method, cv2.THRESH_BINARY, block_size, c)
+        self._set_binary(binary)
+
+    # ---------------- 7 种全局阈值：一行一个 ----------------
+    def imageThresBINARY(self):
+        """黑字白底"""
+        self._global_threshold(cv2.THRESH_BINARY)
+
+    def imageThresBINARYINV(self):
+        """白字黑底"""
+        self._global_threshold(cv2.THRESH_BINARY_INV)
 
     def imageThresTRUNC(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_TRUNC)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """超过阈值的像素被截断为阈值"""
+        self._global_threshold(cv2.THRESH_TRUNC)
 
     def imageThresTOZERO(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_TOZERO)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """小于阈值的像素置 0，其余不变"""
+        self._global_threshold(cv2.THRESH_TOZERO)
 
     def imageThresTOZEROINV(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 127,255,cv2.THRESH_TOZERO_INV)
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
-
-    def imageThresMEANC(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            img_binary = cv2.adaptiveThreshold(img_gray, 255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY, 3, 0) 
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
-
-    def imageThresGAUSSIANC(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            img_binary = cv2.adaptiveThreshold(img_gray, 255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,5, 0)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """大于阈值的像素置 0，其余不变"""
+        self._global_threshold(cv2.THRESH_TOZERO_INV)
 
     def imageThresOtsu(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 0,255,cv2.THRESH_BINARY + cv2.THRESH_OTSU )
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """Otsu：自动取类间方差最大的阈值（thresh 参数会被忽略，填 0）"""
+        self._global_threshold(cv2.THRESH_BINARY + cv2.THRESH_OTSU, 0)
 
     def imageThresTriangle(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            ret,img_binary      = cv2.threshold(img_gray, 0,255,cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE )
-            img_rgb             = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """Triangle：适合直方图呈单峰的图像"""
+        self._global_threshold(cv2.THRESH_BINARY + cv2.THRESH_TRIANGLE, 0)
 
+    # ---------------- 2 种自适应阈值 ----------------
+    def imageThresMEANC(self):
+        self._adaptive_threshold(cv2.ADAPTIVE_THRESH_MEAN_C, block_size=3)
+
+    def imageThresGAUSSIANC(self):
+        self._adaptive_threshold(cv2.ADAPTIVE_THRESH_GAUSSIAN_C, block_size=5)
+
+    # ---------------- 5 种自定义阈值 ----------------
     def imageThresIterative(self):
-        '''迭代阈值法'''
-        def iterative_threshold(img, tolerance=1):
-            """
-            迭代阈值法自动求阈值并二值化
-            :param img: 灰度图像
-            :param tolerance: 收敛容差，默认1
-            :return: (最终阈值, 二值图像)
-            """
-            # 步骤1：初始阈值取图像灰度均值
-            T = np.mean(img)
-            
-            while True:
-                # 步骤2：按当前阈值分割前景和背景
-                foreground = img[img >= T]
-                background = img[img < T]
-                
-                # 防止某一类为空导致均值计算报错
-                if len(foreground) == 0 or len(background) == 0:
-                    break
-                
-                # 步骤3：计算新阈值
-                new_T = (np.mean(foreground) + np.mean(background)) / 2
-                
-                # 步骤4：收敛判断
-                if abs(new_T - T) < tolerance:
-                    T = new_T
-                    break
-                
-                T = new_T
-
-            T = int(T)
-            return T
-
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            T = iterative_threshold(img_gray,1)
-             # 用最终阈值做二值化
-            _,img_binary = cv2.threshold(img_gray, T,255,cv2.THRESH_BINARY)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """迭代阈值法"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        threshold = iterative_threshold(gray, tolerance=1)
+        logging.info("迭代法求得阈值: %s", threshold)
+        self._set_binary(cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)[1])
 
     def imageThresNiblack(self):
-        def niblack_threshold(img, window_size=25, k=-0.2):
-            # 窗口半径
-            h, w = img.shape
-            pad = window_size // 2
-            
-            # 边界填充，避免边缘越界
-            padded = cv2.copyMakeBorder(img, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
-            
-            # 转 float 避免溢出
-            padded = padded.astype(np.float32)
-            
-            # 用均值滤波算局部均值
-            mean = cv2.blur(padded, (window_size, window_size))
-            
-            # 算局部标准差：sqrt(E(x^2) - (E(x))^2)
-            sq_mean = cv2.blur(padded ** 2, (window_size, window_size))
-            std = np.sqrt(sq_mean - mean ** 2)
-            
-            # 阈值曲面
-            thresh = mean + k * std
-            
-            # 去掉填充，恢复原尺寸
-            thresh = thresh[pad:pad+h, pad:pad+w]
-            
-            # 二值化
-            binary = (img > thresh).astype(np.uint8) * 255
-            return binary
-
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            img_binary = niblack_threshold(img_gray, window_size=25, k=-0.2)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """Niblack 局部阈值"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        self._set_binary(niblack_threshold(gray, window_size=25, k=-0.2))
 
     def imageThresSauvola(self):
-        def sauvola_threshold(image, window_size=25, k=0.2, r=128):
-            # 转灰度
-            if len(image.shape) > 2:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            else:
-                gray = image
-
-            # 局部均值 m
-            mean = cv2.blur(gray, (window_size, window_size))
-
-            # 局部标准差 s = sqrt(E(x^2) - (E(x))^2)
-            mean_square = cv2.blur(gray.astype(np.float32)**2, (window_size, window_size))
-            std = np.sqrt(np.maximum(mean_square - mean.astype(np.float32)**2, 0))
-
-            # 计算阈值矩阵
-            threshold = mean.astype(np.float32) * (1 + k * (std / r - 1))
-
-            # 二值化
-            binary = np.zeros_like(gray)
-            binary[gray > threshold] = 255
-            return binary
-
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            img_binary = sauvola_threshold(img_gray, window_size=25, k=-0.2)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_BGR2RGB) 
-            logging.info(type(img_rgb))
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """Sauvola 局部阈值"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        self._set_binary(sauvola_threshold(gray, window_size=25, k=0.2))
 
     def imageThresMEM(self):
-        def mem_threshold(img):
-            # 计算灰度直方图
-            hist = cv2.calcHist([img], [0], None, [256], [0, 256]).ravel()
-            total_pixels = img.shape[0] * img.shape[1]
-            prob = hist / total_pixels  # 归一化概率分布
-            
-            best_thresh = 0
-            max_entropy = -1.0
-            
-            # 遍历所有可能的阈值
-            for t in range(1, 256):
-                # 背景概率分布
-                p_b = prob[:t]
-                sum_b = np.sum(p_b)
-                if sum_b == 0:
-                    continue
-                
-                # 前景概率分布
-                p_f = prob[t:]
-                sum_f = np.sum(p_f)
-                if sum_f == 0:
-                    continue
-                
-                # 归一化并计算背景熵
-                p_b_norm = p_b / sum_b
-                # 避免log(0)
-                p_b_norm = p_b_norm[p_b_norm > 0]
-                entropy_b = -np.sum(p_b_norm * np.log2(p_b_norm))
-                
-                # 归一化并计算前景熵
-                p_f_norm = p_f / sum_f
-                p_f_norm = p_f_norm[p_f_norm > 0]
-                entropy_f = -np.sum(p_f_norm * np.log2(p_f_norm))
-                
-                # 总熵
-                total_entropy = entropy_b + entropy_f
-                
-                if total_entropy > max_entropy:
-                    max_entropy = total_entropy
-                    best_thresh = t
-            
-            # 用最佳阈值做二值化
-            _, binary = cv2.threshold(img, best_thresh, 255, cv2.THRESH_BINARY)
-            return best_thresh, binary
-
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            best_thresh, binary = mem_threshold(img_gray)
-            _,img_binary = cv2.threshold(binary, best_thresh, 255, cv2.THRESH_BINARY)
-            img_rgb    = cv2.cvtColor(img_binary, cv2.COLOR_GRAY2RGB)  
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """最大熵法"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        threshold = max_entropy_threshold(gray)
+        logging.info("最大熵法求得阈值: %s", threshold)
+        self._set_binary(cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)[1])
 
     def imageThresMultiDomainSegmentation(self):
-        # ---------- 方法一：NumPy 分段映射 ----------
-        def multi_threshold_numpy(image, thresholds, values):
-            """
-            thresholds: 阈值列表，如 [80, 160]
-            values: 各区间对应的输出灰度值，长度 = len(thresholds) + 1
-            """
-            result = np.zeros_like(image)
-            # 第一段：小于 thresholds
-            result[image < thresholds] = values
-            # 中间段
-            for i in range(len(thresholds) - 1):
-                mask = (image >= thresholds[i]) & (image < thresholds[i+1])
-                result[mask] = values[i+1]
-            # 最后一段：大于等于最后一个阈值
-            result[image >= thresholds[-1]] = values[-1]
-            return result
-            # 示例：分成4个灰度区间
-            # thresh_list = [60, 120, 180]
-            # out_values = [0, 85, 170, 255]  # 对应4个区间
-            # result_np = multi_threshold_numpy(img, thresh_list, out_values)
+        """多阈值分层：0/85/170/255 四档灰度，能直观看出灰度区间分布"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        self._set_binary(multi_threshold(gray, thresholds=(60, 120, 180),
+                                        values=(0, 85, 170, 255)))
 
-        # ---------- 方法二：多次 threshold + 掩码组合 ----------
-        def multi_threshold_opencv(image, thresholds):
-            """返回多个二值掩码，每个掩码对应一个区间"""
-            thresholds = sorted(thresholds)  # 确保阈值有序
-            masks = []
-            
-            # 小于第一个阈值
-            _, mask_lt = cv2.threshold(image, thresholds[0], 255, cv2.THRESH_BINARY_INV)
-            masks.append(mask_lt)
-            
-            # 中间区间 [t[i], t[i+1])
-            for i in range(len(thresholds) - 1):
-                _, low = cv2.threshold(image, thresholds[i], 255, cv2.THRESH_BINARY)
-                _, high = cv2.threshold(image, thresholds[i+1], 255, cv2.THRESH_BINARY_INV)
-                masks.append(cv2.bitwise_and(low, high))
-            
-            # 大于等于最后一个阈值
-            _, mask_ge = cv2.threshold(image, thresholds[-1], 255, cv2.THRESH_BINARY)
-            masks.append(mask_ge)
-            return masks
-        
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            # 全局均衡化算法
-            thresh_list = [60, 120, 180, 240]  # 阈值参数可以调整
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            masks      = multi_threshold_opencv(img_gray, thresh_list)
-            img_rgb    = cv2.cvtColor(masks[0], cv2.COLOR_GRAY2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
 
 class FilteringPanel(FilteringPanelTemplate):
     """FilteringPanel 的事件处理与算法实现。"""
 
-    def imageFilteringOnRadioBox( self, event ):              
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageProcessBlur()
-            case 1:
-                self.imageProcessBoxBlur()
-            case 2:
-                self.imageProcessGaussianBlur()
-            case 3:
-                self.imageProcessMedianBlur()
-            case 4:
-                self.imageProcessBilateral()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    _HANDLERS = ("imageProcessBlur", "imageProcessBoxBlur", "imageProcessGaussianBlur",
+                 "imageProcessMedianBlur", "imageProcessBilateral")
+
+    @safe_process
+    def imageFilteringOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的滤波选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
+    def _apply(self, fn):
+        """取原图 BGR -> 套用滤波函数 -> 回写，五种滤波只差一个 fn。"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        self.parent_frame.processed_pil_image = bgr_to_pil(fn(img_bgr))
+
     def imageProcessBlur(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            # 1. 均值滤波：核大小用元组(宽,高)，必须是奇数
-            mean_blur  = cv2.blur(img_bgr, (5, 5))
-            img_rgb    = cv2.cvtColor(mean_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """均值滤波：核大小 (宽, 高)，必须是奇数"""
+        self._apply(lambda im: cv2.blur(im, (5, 5)))
 
     def imageProcessBoxBlur(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            # 2. 方框滤波：normalize=True时与均值滤波相同；False时求像素和，易溢出变白
-            box_normal = cv2.boxFilter(img_bgr, -1, (5, 5), normalize=True)
-            box_raw    = cv2.boxFilter(img_bgr, -1, (5, 5), normalize=False)
-            img_rgb    = cv2.cvtColor(box_raw, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """方框滤波：normalize=True 时等价于均值滤波；
+        normalize=False 是求像素和，5x5 时很容易溢出成纯白，这里用 True 演示。"""
+        self._apply(lambda im: cv2.boxFilter(im, -1, (5, 5), normalize=True))
 
     def imageProcessGaussianBlur(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            img_bgr        = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            # 3. 高斯滤波：核大小必须奇数，sigmaX=0时自动根据核尺寸计算
-            gaussian_blur  = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-            # 也可手动指定sigma，sigma越大越模糊
-            gaussian_blur2 = cv2.GaussianBlur(img_bgr, (5, 5), 1.5)
-            img_rgb        = cv2.cvtColor(gaussian_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """高斯滤波：sigmaX=0 时按核尺寸自动推算"""
+        self._apply(lambda im: cv2.GaussianBlur(im, (5, 5), 0))
 
     def imageProcessMedianBlur(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            median_blur = cv2.medianBlur(img_bgr, 5)
-            img_rgb     = cv2.cvtColor(median_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """中值滤波：对椒盐噪声效果最好"""
+        self._apply(lambda im: cv2.medianBlur(im, 5))
 
     def imageProcessBilateral(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            # 1. 均值滤波：核大小用元组(宽,高)，必须是奇数
-            mean_blur  = cv2.blur(img_bgr, (5, 5))
-            img_rgb    = cv2.cvtColor(mean_blur, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """双边滤波：d=9, sigmaColor=75, sigmaSpace=75 是常用经验值，保边去噪"""
+        self._apply(lambda im: cv2.bilateralFilter(im, 9, 75, 75))
+
 
 class MorphologicalOperationPanel(MorphologicalOperationPanelTemplate):
     """MorphologicalOperationPanel 的事件处理与算法实现。"""
 
-    def imageMorphologicalOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageErosion()
-            case 1:
-                self.imageDilation()
-            case 2:
-                self.imageOpening()
-            case 3:
-                self.imageClosing()
-            case 4:
-                self.imageGradient()
-            case 5:
-                self.imageTophat()
-            case 6:
-                self.imageBlackhat()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    _HANDLERS = ("imageErosion", "imageDilation", "imageOpening", "imageClosing",
+                 "imageGradient", "imageTophat", "imageBlackhat")
+
+    # 结构元素只建一次：矩形核 5x5（原来每个方法都建三个核，其中两个从没用过）
+    _KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+    @safe_process
+    def imageMorphologicalOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的形态学选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
+    def _binary(self):
+        """形态学通常处理二值图：灰度化 + 固定阈值 127 二值化。"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return None
+        return cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)[1]
+
+    def _simple(self, fn):
+        binary = self._binary()
+        if binary is None:
+            return
+        self.parent_frame.processed_pil_image = bgr_to_pil(fn(binary, self._KERNEL, iterations=1))
+
+    def _morph_ex(self, op):
+        binary = self._binary()
+        if binary is None:
+            return
+        result = cv2.morphologyEx(binary, op, self._KERNEL)
+        self.parent_frame.processed_pil_image = bgr_to_pil(result)
+
     def imageErosion(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
+        """腐蚀：让白色前景变小，去掉细小噪点"""
+        self._simple(cv2.erode)
 
-            # 腐蚀
-            eroded          = cv2.erode(binary, kernel_rect, iterations=1)
-            img_rgb         = cv2.cvtColor(eroded, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
-
-    def imageDilation(self) :
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
-
-            # 膨胀
-            dilated         = cv2.dilate(binary, kernel_rect, iterations=1)
-            img_rgb         = cv2.cvtColor(dilated, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+    def imageDilation(self):
+        """膨胀：让白色前景变大，填补小孔"""
+        self._simple(cv2.dilate)
 
     def imageOpening(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
-
-            # 开运算（去噪）
-            opened          = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_rect)
-            img_rgb         = cv2.cvtColor(opened, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """开运算 = 先腐蚀后膨胀：去掉外部噪点，位置和大小基本不变"""
+        self._morph_ex(cv2.MORPH_OPEN)
 
     def imageClosing(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
-
-            # 闭运算（补洞）
-            closed          = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_rect)
-            img_rgb         = cv2.cvtColor(closed, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """闭运算 = 先膨胀后腐蚀：填补前景内部的小洞"""
+        self._morph_ex(cv2.MORPH_CLOSE)
 
     def imageGradient(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
-
-            # 形态学梯度（边缘）
-            gradient        = cv2.morphologyEx(binary, cv2.MORPH_GRADIENT, kernel_rect)
-            img_rgb         = cv2.cvtColor(gradient, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """形态学梯度 = 膨胀 - 腐蚀：得到边缘"""
+        self._morph_ex(cv2.MORPH_GRADIENT)
 
     def imageTophat(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))   # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
-
-            # 顶帽（提取亮细节）
-            tophat          = cv2.morphologyEx(binary, cv2.MORPH_TOPHAT, kernel_rect)
-            img_rgb         = cv2.cvtColor(tophat, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """顶帽 = 原图 - 开运算：提取亮的小细节"""
+        self._morph_ex(cv2.MORPH_TOPHAT)
 
     def imageBlackhat(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:            
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 二值化（形态学通常处理二值图）
-            _, binary       = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
-            # 创建结构元素（核）
-            kernel_rect     = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))      # 矩形核
-            kernel_ellipse  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) # 椭圆核
-            kernel_cross    = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))     # 十字核
+        """黑帽 = 闭运算 - 原图：提取暗的小细节"""
+        self._morph_ex(cv2.MORPH_BLACKHAT)
 
-            # 黑帽（提取暗细节）
-            blackhat        = cv2.morphologyEx(binary, cv2.MORPH_BLACKHAT, kernel_rect)
-            img_rgb         = cv2.cvtColor(blackhat, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
 
 class ROIPanel(ROIPanelTemplate):
     """ROIPanel 的事件处理与算法实现。"""
 
-    def imageAutoROIBtnClick( self, event ):
+    @safe_process
+    def imageAutoROIBtnClick(self, event):
         self.imageAutoROI()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
-    def imageAutoROI(self):        
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:           
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 用Haar级联检测人脸，自动得到ROI
-            face_cascade    = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            faces           = face_cascade.detectMultiScale(img_gray, scaleFactor=1.1, minNeighbors=5)            
+    def imageAutoROI(self):
+        """用 Haar 级联检测人脸，把最大的一张脸裁出来当作 ROI。"""
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        height, width = gray.shape[:2]
 
-            for (x, y, w, h) in faces:
-                pad = 20  # 往外扩一点，别裁太贴
-                x1, y1      = max(x-pad, 0), max(y-pad, 0)
-                x2, y2      = min(x+w+pad, img_gray.shape[0]), min(y+h+pad, img_gray.shape[1])
-                face_roi    = img_gray[y1:y2, x1:x2].copy()
-            img_rgb         = cv2.cvtColor(face_roi, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+
+        if len(faces) == 0:
+            logging.info("未检测到人脸，右侧显示原图")
+            wx.MessageBox("没有检测到人脸，可能这张图里没有人或者角度太偏。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
+
+        # 多张脸时取面积最大的那张，避免只留下循环里最后一张
+        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+        pad = 20                                      # 往外扩一点，别裁太贴
+        x1, y1 = max(x - pad, 0), max(y - pad, 0)
+        x2, y2 = min(x + w + pad, width), min(y + h + pad, height)   # 宽用 width、高用 height
+        self.parent_frame.processed_pil_image = bgr_to_pil(gray[y1:y2, x1:x2])
+
 
 class CornerDetectionPanel(CornerDetectionPanelTemplate):
     """CornerDetectionPanel 的事件处理与算法实现。"""
 
-    def imageCornerDetectionOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageHarris()
-            case 1:
-                self.imageShiTomasi()
-            case 2:
-                self.imageOrb()
-            case 3:
-                self.imageFast()
-            case 4:
-                self.imageSift()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    _HANDLERS = ("imageHarris", "imageShiTomasi", "imageOrb", "imageFast", "imageSift")
+
+    @safe_process
+    def imageCornerDetectionOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的角点检测选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def imageHarris(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:           
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            img_gray   = np.float32(img_gray)
-
-            # 核心一行：blockSize 邻域大小，ksize Sobel 孔径，k 经验值 0.04~0.06
-            dst         = cv2.cornerHarris(img_gray, blockSize=2, ksize=3, k=0.04)
-
-            # 膨胀让角点更显眼，阈值取响应最大值的 1%~5%
-            dst         = cv2.dilate(dst, None)
-            img_bgr[dst > 0.01 * dst.max()] = [0, 0, 255]  # 红色标记
-            img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """Harris 角点：响应值超过最大值 1% 的像素标红"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        # blockSize 邻域大小，ksize Sobel 孔径，k 经验值 0.04~0.06
+        response = cv2.cornerHarris(np.float32(gray), blockSize=2, ksize=3, k=0.04)
+        response = cv2.dilate(response, None)            # 膨胀让角点更显眼
+        img_bgr[response > 0.01 * response.max()] = [0, 0, 255]
+        self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
     def imageShiTomasi(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:           
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-            # maxCorners 最多返回多少个角点
-            # qualityLevel 质量阈值，越小检测越严格（0.01~0.1）
-            # minDistance 两个角点之间的最小距离，避免密集扎堆
-            corners = cv2.goodFeaturesToTrack(img_gray, maxCorners=50, qualityLevel=0.01, minDistance=10)
-
-            if corners is not None:
-                corners = np.int32(corners)
-                for i in corners:
-                    x, y = i.ravel()
-                    cv2.circle(img_bgr, (x, y), 3, (0, 255, 0), -1)
-            img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """Shi-Tomasi（goodFeaturesToTrack）角点：绿色圆点标记"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        # qualityLevel 越小检出越多，minDistance 避免角点扎堆
+        corners = cv2.goodFeaturesToTrack(gray, maxCorners=50,
+                                          qualityLevel=0.01, minDistance=10)
+        if corners is not None:
+            for x, y in np.int32(corners).reshape(-1, 2):
+                cv2.circle(img_bgr, (x, y), 3, (0, 255, 0), -1)
+        self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
     def imageOrb(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:           
-            img_bgr    = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-            orb = cv2.ORB_create(nfeatures=500)
-
-            # 检测关键点和描述子
-            kp, des = orb.detectAndCompute(img_gray, None)
-            # 3. 把关键点绘制在原图上
-            img_with_kp = cv2.drawKeypoints(img_gray, kp, None, color=(0, 255, 0), flags=0)
-            img_rgb     = cv2.cvtColor(img_with_kp, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """ORB：在彩色原图上画关键点，圆的大小代表特征尺度"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        keypoints = cv2.ORB_create(nfeatures=500).detect(gray, None)
+        result = cv2.drawKeypoints(img_bgr, keypoints, None,
+                                   color=(0, 255, 0),
+                                   flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageFast(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:           
-            img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)        
-            # threshold 越大角点越少但更稳定
-            # nonmaxSuppression 开启非极大值抑制，避免重复检测
-            fast        = cv2.FastFeatureDetector_create(threshold=30, nonmaxSuppression=True)
-
-            keypoints   = fast.detect(img_gray, None)
-            img_kp      = cv2.drawKeypoints(img_bgr, keypoints, None, color=(0, 255, 0))
-
-            img_rgb     = cv2.cvtColor(img_kp, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """FAST：threshold 越大角点越少但越稳定"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        detector = cv2.FastFeatureDetector_create(threshold=30, nonmaxSuppression=True)
+        keypoints = detector.detect(gray, None)
+        result = cv2.drawKeypoints(img_bgr, keypoints, None, color=(0, 255, 0))
+        self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageSift(self):
-        pil_img = self.parent_frame.original_pil_image
-        if pil_img:           
-            img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            # 2. 创建SIFT对象（OpenCV 4.4+直接用cv2.SIFT_create）
-            sift        = cv2.SIFT_create(nfeatures=5000, contrastThreshold=0.04, edgeThreshold=10)
+        """SIFT：OpenCV 4.4+ 可直接 cv2.SIFT_create"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        sift = cv2.SIFT_create(nfeatures=5000, contrastThreshold=0.04, edgeThreshold=10)
+        keypoints = sift.detect(gray, None)
+        result = cv2.drawKeypoints(img_bgr, keypoints, None,
+                                   color=(0, 255, 0),
+                                   flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
-            # 3. 检测关键点并计算128维描述子
-            kp, des     = sift.detectAndCompute(img_gray, None)
-
-            # 4. 把关键点绘制在原图上
-            img_with_kp = cv2.drawKeypoints(img_gray, kp, None, color=(0, 255, 0), flags=0)
-            img_rgb     = cv2.cvtColor(img_with_kp, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
 
 class EdgeDetectionPanel(EdgeDetectionPanelTemplate):
     """EdgeDetectionPanel 的事件处理与算法实现。"""
@@ -1291,41 +1007,38 @@ class EdgeDetectionPanel(EdgeDetectionPanelTemplate):
             case 3:
                 self.imageScharr()
             case _:
-                print("error")
-                event.Skip()
+                logging.warning("未知的选项: %s", self.m_radioBox2.GetSelection())
         self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
         event.Skip()
 
     def imageCanny(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr     = frame_bgr(self.parent_frame)
             img_gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             # 2. 高斯模糊降噪（核大小5x5）
             blurred     = cv2.GaussianBlur(img_gray, (5, 5), 1.4)
 
             # 3. Canny边缘检测（低阈值50，高阈值150）
             edges       = cv2.Canny(blurred, 50, 150)
-            img_rgb     = cv2.cvtColor(edges, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(edges)
 
     def imageSobel(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr     = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr     = frame_bgr(self.parent_frame)
             img_gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)        
 
             sobel_x     = cv2.Sobel(img_gray, cv2.CV_64F, 1, 0, ksize=3)  # x方向
             sobel_y     = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)  # y方向
             sobel       = np.sqrt(sobel_x**2 + sobel_y**2)
             sobel_abs   = cv2.convertScaleAbs(sobel)
-            img_rgb     = cv2.cvtColor(sobel_abs, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(sobel_abs)
 
     def imageLaplacian(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr         = frame_bgr(self.parent_frame)
             img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
             # 2. 应用 Laplacian 算子
@@ -1333,13 +1046,12 @@ class EdgeDetectionPanel(EdgeDetectionPanelTemplate):
             laplacian       = cv2.Laplacian(img_gray, cv2.CV_64F, ksize=3)
             # 3. 取绝对值并转回 8 位图以便显示
             laplacian_abs   = cv2.convertScaleAbs(laplacian)
-            img_rgb     = cv2.cvtColor(laplacian_abs, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(laplacian_abs)
 
     def imageScharr(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr         = frame_bgr(self.parent_frame)
             img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
             # 2. 计算X和Y方向的Scharr梯度
@@ -1351,8 +1063,8 @@ class EdgeDetectionPanel(EdgeDetectionPanelTemplate):
             abs_y           = cv2.convertScaleAbs(grad_y)
             # 4. 将两个方向加权合并（各占50%）
             scharr_xy       = cv2.addWeighted(abs_x, 0.5, abs_y, 0.5, 0)
-            img_rgb         = cv2.cvtColor(scharr_xy, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(scharr_xy)
+
 
 class GeometricShapePanel(GeometricShapePanelTemplate):
     """GeometricShapePanel 的事件处理与算法实现。"""
@@ -1378,15 +1090,14 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
             case 8:
                 self.imageLeastSquaresCircleFitting()
             case _:
-                print("error")
-                event.Skip()
+                logging.warning("未知的选项: %s", self.m_radioBox2.GetSelection())
         self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
         event.Skip()
 
     def imageHoughLinesP(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr         = frame_bgr(self.parent_frame)
             img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)        
             # 2. Canny 边缘检测（HoughLinesP 输入必须是二值图）
             edges           = cv2.Canny(img_gray, 50, 150, apertureSize=3)
@@ -1401,18 +1112,16 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
                 maxLineGap=10       # 最大断缝间隔，允许连接断开的线段
             )
 
-            # 4. 绘制检测到的线段
+            # 4. 在彩色原图上绘制线段（画在灰度图上会丢掉颜色）
             if lines is not None:
-                for line in lines:
-                    x1, y1, x2, y2 = line
-                    cv2.line(img_gray, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            img_rgb         = cv2.cvtColor(img_gray, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+                for x1, y1, x2, y2 in lines.reshape(-1, 4):
+                    cv2.line(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
     def imageHoughCircles(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr         = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr         = frame_bgr(self.parent_frame)
             img_gray        = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)         
             # 2. 平滑去噪（中值滤波对椒盐噪声效果好）
             img_gray        = cv2.medianBlur(img_gray, 5)
@@ -1428,13 +1137,12 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
                 for (x, y, r) in circles[0, :]:
                     cv2.circle(img_bgr, (x, y), r, (0, 255, 0), 2)   # 画圆
                     cv2.circle(img_bgr, (x, y), 2, (0, 0, 255), 3)   # 画圆心
-            img_rgb         = cv2.cvtColor(img_gray, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
     def imageContour(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)         
             # 2. 二值化（黑底白物）
             ret, binary         = cv2.threshold(img_gray, 127, 255, cv2.THRESH_BINARY)
@@ -1445,13 +1153,12 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
             # 4. 在原图上画出所有轮廓
             cv2.drawContours(img_bgr, contours, -1, (0, 255, 0), 2)
 
-            img_rgb             = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
     def imageLineSegmentDetector(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
             # 3. 创建 LSD 检测器
@@ -1471,20 +1178,22 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
                     x1, y1, x2, y2 = map(int, line)
                     cv2.line(result, (x1, y1), (x2, y2), (0, 0, 255), 2)
 
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageFastLineDetector(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)        
             # 3. 创建FLD检测器（参数可调）
             # length_threshold: 线段最小长度，小于该值被丢弃
             # distance_threshold: 点到假设线段的距离超过该值视为异常点
             # canny_th1/canny_th2: Canny边缘检测的双阈值
             # do_merge: 是否合并短线段
-            fld = cv2.ximgproc.createFastLineDetector(
+            fld = _get_ximgproc(self, "createFastLineDetector")
+            if fld is None:
+                return
+            fld = fld.createFastLineDetector(
                 length_threshold=10,
                 distance_threshold=1.41421356,
                 canny_th1=50,
@@ -1495,7 +1204,11 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
 
             # 4. 检测直线
             lines = fld.detect(img_gray)
-            print(f"检测到 {len(lines)} 条直线")
+            if lines is None:                      # 没检测到时直接返回，避免 len(None) 报错
+                logging.info("未检测到直线")
+                self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
+                return
+            logging.info("检测到 %s 条直线", len(lines))
 
             # 5. 在原图上绘制检测结果
             drawn_img = fld.drawSegments(img_bgr, lines)
@@ -1504,13 +1217,12 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
             #     x0, y0, x1, y1 = line
             #     cv2.line(drawn_img, (int(x0), int(y0)), (int(x1), int(y1)), (0, 255, 0), 1)
             # 6. 转换为PIL Image格式（关键步骤：BGR → RGB）
-            img_rgb             = cv2.cvtColor(drawn_img, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(drawn_img)
 
     def imageBlob(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) 
 
             # 3. 设置 SimpleBlobDetector 参数
@@ -1542,23 +1254,25 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
             detector  = cv2.SimpleBlobDetector_create(params)
             keypoints = detector.detect(img_gray)
 
-            # 5. 把 Blob 画在原图上（红色圆圈，大小对应 Blob 半径）
+            # 5. 把 Blob 画在彩色原图上（红色圆圈，大小对应 Blob 半径）
             result = cv2.drawKeypoints(
-                img_gray, keypoints, np.array([]), (0, 0, 255),
+                img_bgr, keypoints, None, (0, 0, 255),
                 cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
             )
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageEdgeDrawing(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
+            ximgproc = _get_ximgproc(self, "createEdgeDrawing")
+            if ximgproc is None:
+                return
             # 3. 创建 EdgeDrawing 对象并设置参数
-            ed                              = cv2.ximgproc.createEdgeDrawing()            
-            #params                          = cv2.ximgproc.EdgeDrawing_Params()
+            ed                              = ximgproc.createEdgeDrawing()
+            #params                          = ximgproc.EdgeDrawing_Params()
             ed.Params.MinPathLength            = 50      # 最小边缘路径长度，值越大越过滤短边
             ed.Params.PFmode                   = False   # 是否使用概率森林模式
             ed.Params.MinLineLength            = 20      # 最小直线长度
@@ -1572,56 +1286,42 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
 
             # 5. 检测直线和椭圆/圆
             lines    = ed.detectLines()
-            logging.info(type(lines))
-            logging.info(len(lines))
             ellipses = ed.detectEllipses() #包含椭圆中心x坐标、中心y坐标、长半轴长度、短半轴长度、椭圆长轴与水平轴的旋转角度、椭圆的置信度
-            logging.info(type(ellipses))
-            logging.info(len(ellipses))
+            logging.info("边缘线段 %s 条, 直线 %s 条, 椭圆 %s 个",
+                         len(segments) if segments is not None else 0,
+                         len(lines) if lines is not None else 0,
+                         len(ellipses) if ellipses is not None else 0)
 
             # 6. 把结果画到原图上
-            result   = img_bgr.copy()
+            result = img_bgr.copy()
 
             # 画边缘线段（随机颜色）
             if segments is not None:
                 for seg in segments:
-                    color = tuple(np.random.randint(0, 256, 3).tolist())
+                    color = tuple(int(c) for c in np.random.randint(0, 256, 3))
                     cv2.polylines(result, [seg], False, color, 1, cv2.LINE_8)
-
-                for line in lines:
-                    x1, y1, x2, y2 = map(int, line)
-                    cv2.line(result, (x1, y1), (x2, y2), (0, 0, 255), 2)
-
 
             # 画直线（红色）
             if lines is not None:
-                lines = np.uint16(np.around(lines))
-                for line in lines:
+                for line in np.uint16(np.around(lines)).reshape(-1, 4):
                     x1, y1, x2, y2 = map(int, line)
                     cv2.line(result, (x1, y1), (x2, y2), (0, 0, 255), 1, cv2.LINE_AA)
 
-            # 画椭圆/圆（绿色=圆，红色=椭圆）
+            # 画椭圆/圆（圆=红色，椭圆=绿色）
             if ellipses is not None:
-                ellipses = np.uint16(np.around(ellipses))
-                for ellipse in ellipses:
-                    x_center, y_centor, long_length, short_length, x_angle, _ = map(int, ellipse)
-                    center = (x_center, y_centor)
-                    axes   = (x_center + long_length, y_centor + short_length)
-                    angle  = x_angle
-
-                    if abs(long_length - short_length) < 5: #圆
-                        color = (0, 0, 255)  # 红色
-                    else:
-                        color = (0, 255, 0)  # 绿色
-                
+                for ellipse in np.uint16(np.around(ellipses)).reshape(-1, 6):
+                    x_center, y_center, long_length, short_length, angle, _ = map(int, ellipse)
+                    center = (x_center, y_center)
+                    axes = (long_length, short_length)      # 长短半轴，不是中心坐标+半轴
+                    color = (0, 0, 255) if abs(long_length - short_length) < 5 else (0, 255, 0)
                     cv2.ellipse(result, center, axes, angle, 0, 360, color, 2, cv2.LINE_AA)
 
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageHull(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
             # 2. 二值化（前景为白色）
@@ -1638,11 +1338,12 @@ class GeometricShapePanel(GeometricShapePanelTemplate):
                 hull = cv2.convexHull(cnt)      # 默认 returnPoints=True，返回顶点坐标
                 cv2.polylines(result, [hull], True, (0, 0, 255), 2)
 
-            img_rgb             = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageLeastSquaresCircleFitting(self):
-        pass
+        """TODO: 最小二乘圆拟合（可用 cv2.fitEllipse 或 Kasa 算法求圆心半径）"""
+        logging.warning("最小二乘圆拟合尚未实现")
+
 
 class MovingObjectDetectionPanel(MovingObjectDetectionPanelTemplate):
     """MovingObjectDetectionPanel 的事件处理与算法实现。"""
@@ -1656,15 +1357,14 @@ class MovingObjectDetectionPanel(MovingObjectDetectionPanelTemplate):
             case 2:
                 self.imageHOG()
             case _:
-                print("error")
-                event.Skip()
+                logging.warning("未知的选项: %s", self.m_radioBox2.GetSelection())
         self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
         event.Skip()
 
     def imageHaar(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
             # 1. 加载 Haar 级联分类器（使用 OpenCV 自带的人脸检测模型）
@@ -1685,53 +1385,51 @@ class MovingObjectDetectionPanel(MovingObjectDetectionPanelTemplate):
                 cv2.rectangle(img_bgr, (x, y), (x + w, y + h), (0, 0, 255), 2)
 
             # 5. 关键步骤：OpenCV 默认是 BGR，PIL 需要 RGB，必须转换
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
-    def imageMatchTemplate(self):        
-        pil_img             = self.parent_frame.original_pil_image
-        pil_img_template    = self.parent_frame.processed_pil_image
-        if pil_img: 
-            # 1. 读取原图和模板
-            # 待匹配的大图          
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度）
-            # 模板图，以灰度模式读取
-            pil_img_template_bgr    = cv2.cvtColor(np.asarray(pil_img_template), cv2.COLOR_RGB2BGR)
-            pil_img_template_gray   = cv2.cvtColor(pil_img_template_bgr, cv2.COLOR_BGR2GRAY)
+    def imageMatchTemplate(self):
+        """模板匹配：用右侧的对比图当模板，在左侧主图里找最相似的位置。"""
+        pil_img = self.parent_frame.original_pil_image
+        pil_img_template = self.parent_frame.processed_pil_image
+        if pil_img is None:
+            return
+        if pil_img_template is None:
+            wx.MessageBox("请先点「打开对比图」选一张模板图片，再执行模板匹配。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
 
-            # 3. 执行模板匹配
-            # 常用方法：cv2.TM_CCOEFF_NORMED（推荐）、cv2.TM_SQDIFF、cv2.TM_CCORR_NORMED
-            result = cv2.matchTemplate(img_gray, pil_img_template_gray, cv2.TM_CCOEFF_NORMED)
-            print(result)
+        img_bgr = frame_bgr(self.parent_frame)
+        img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        template_gray = pil_to_gray(pil_img_template)
 
-            # 4. 获取最佳匹配位置
-            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        # 模板比原图还大时 matchTemplate 会直接抛错，先挡掉
+        if (template_gray.shape[0] > img_gray.shape[0]
+                or template_gray.shape[1] > img_gray.shape[1]):
+            wx.MessageBox("模板图片比原图还大，无法匹配，请换一张更小的模板。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
 
-            # 对于 TM_SQDIFF 系列，值越小越好；其他方法值越大越好
-            if cv2.TM_SQDIFF in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
-                top_left = min_loc
-            else:
-                top_left = max_loc
-            
-            # 5. 在原图上画矩形框标记匹配区域
-            h, w = pil_img_template_gray.shape[:2]
-            print(type(top_left))
-            print(top_left)
-            print(w)
-            print(h)
-            bottom_right = (top_left[0] + w, top_left[1] + h )
-            cv2.rectangle(img_bgr, top_left, bottom_right, (0, 0, 255), 2)
+        method = cv2.TM_CCOEFF_NORMED
+        result = cv2.matchTemplate(img_gray, template_gray, method)
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
 
-            # 6. 将 OpenCV 的 BGR 图转为 PIL Image
-            # 关键：必须先把 BGR 转成 RGB，否则颜色会失真
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        # TM_CCOEFF_NORMED 是「越大越匹配」，所以取 max_loc；
+        # 如果换成 TM_SQDIFF / TM_SQDIFF_NORMED，就要改成 min_loc（值越小越匹配）
+        if method in (cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED):
+            top_left, score = min_loc, min_val
+        else:
+            top_left, score = max_loc, max_val
+        logging.info("模板匹配相似度: %.4f", score)
+
+        h, w = template_gray.shape[:2]
+        bottom_right = (top_left[0] + w, top_left[1] + h)
+        cv2.rectangle(img_bgr, top_left, bottom_right, (0, 0, 255), 2)
+        self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
 
     def imageHOG(self):
         pil_img = self.parent_frame.original_pil_image
         if pil_img:           
-            img_bgr             = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr             = frame_bgr(self.parent_frame)
             img_gray            = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)# 1. 读取图像并转灰度
 
             # 2. 初始化 HOG 描述符
@@ -1760,8 +1458,8 @@ class MovingObjectDetectionPanel(MovingObjectDetectionPanelTemplate):
         
             # 6. 将 OpenCV 的 BGR 图转为 PIL Image
             # 关键：必须先把 BGR 转成 RGB，否则颜色会失真
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
+
 
 class ObjectDetectionPanel(ObjectDetectionPanelTemplate):
     """ObjectDetectionPanel 的事件处理与算法实现。"""
@@ -1775,19 +1473,25 @@ class ObjectDetectionPanel(ObjectDetectionPanelTemplate):
             case 2:
                 self.imageOpticalFlow()
             case _:
-                print("error")
-                event.Skip()
+                logging.warning("未知的选项: %s", self.m_radioBox2.GetSelection())
         self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
         event.Skip()
 
+    def _todo(self, name):
+        logging.warning("%s 尚未实现", name)
+
     def imageBackgroundSubstraction(self):
-        pass
+        """TODO: 背景减除，可用 cv2.createBackgroundSubtractorMOG2() 处理视频帧"""
+        self._todo("背景减除")
 
     def imageFrameDifferencing(self):
-        pass
+        """TODO: 帧差法，处理视频帧序列时用 absdiff(前一帧, 当前帧)"""
+        self._todo("帧差法")
 
     def imageOpticalFlow(self):
-        pass
+        """TODO: 光流法，可用 cv2.calcOpticalFlowFarneback()"""
+        self._todo("光流法")
+
 
 class WatershedPanel(WatershedPanelTemplate):
     """WatershedPanel 的事件处理与算法实现。"""
@@ -1808,7 +1512,7 @@ class WatershedPanel(WatershedPanelTemplate):
         if pil_img: 
             # 1. 读取原图和模板
             # 待匹配的大图          
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr                 = frame_bgr(self.parent_frame)
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度）
 
             ret, thresh = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -1843,8 +1547,7 @@ class WatershedPanel(WatershedPanelTemplate):
             bg_mask = (markers == 1) | (markers == -1)
             result[bg_mask] = [255, 255, 255]  # BGR白色
 
-            img_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
     def imageWatershedCoinsPro(self):
         pil_img             = self.parent_frame.original_pil_image
@@ -1852,7 +1555,7 @@ class WatershedPanel(WatershedPanelTemplate):
         if pil_img: 
             # 1. 读取原图和模板
             # 待匹配的大图          
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr                 = frame_bgr(self.parent_frame)
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度）
 
             # 3. Otsu 二值化（反转，前景为白）
@@ -1885,32 +1588,30 @@ class WatershedPanel(WatershedPanelTemplate):
             img_bgr[markers == -1] = [0, 0, 255]
 
             # 11. 将 BGR 转为 RGB，再用 PIL Image 显示
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
+
 
 class PyramidPanel(PyramidPanelTemplate):
     """PyramidPanel 的事件处理与算法实现。"""
 
-    def imagePyramidOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageGaussianPyramid() 
-            case 1:
-                self.imageLaplusPyramid()
-            case 2:
-                self.imageLaplacianPyramidReconstruction()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    _HANDLERS = ("imageGaussianPyramid", "imageLaplusPyramid",
+                 "imageLaplacianPyramidReconstruction")
+
+    @safe_process
+    def imagePyramidOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的金字塔选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def build_gaussian_pyramid(self, img, levels=3):
-        """构建高斯金字塔（下采样）"""
+        """构建高斯金字塔（逐级 pyrDown 下采样）"""
         pyramid = [img.copy()]
-        for i in range(levels):
-            img = cv2.pyrDown(img)
-            pyramid.append(img)
+        for _ in range(levels):
+            pyramid.append(cv2.pyrDown(pyramid[-1]))
         return pyramid
 
     def build_laplacian_pyramid(self, img, levels=4):
@@ -1920,253 +1621,202 @@ class PyramidPanel(PyramidPanelTemplate):
         :param levels: 金字塔层数
         :return: 拉普拉斯金字塔列表，最后一项是最小的高斯残差图
         """
-
         # 1. 构建高斯金字塔
         gaussian_pyramid = [img]
-        for i in range(levels - 1):
-            img = cv2.pyrDown(img)
-            gaussian_pyramid.append(img)
+        for _ in range(levels - 1):
+            gaussian_pyramid.append(cv2.pyrDown(gaussian_pyramid[-1]))
 
-        # 2. 构建拉普拉斯金字塔
+        # 2. 构建拉普拉斯金字塔：每层 = 该层高斯 - 下一层上采样
         laplacian_pyramid = []
         for i in range(levels - 1):
-            size = (gaussian_pyramid[i].shape[0], gaussian_pyramid[i].shape[0])
+            # pyrUp 的 dstsize 是 (宽, 高)，写成 (高, 高) 会让非正方形图直接报错
+            size = (gaussian_pyramid[i].shape[1], gaussian_pyramid[i].shape[0])
             expanded = cv2.pyrUp(gaussian_pyramid[i + 1], dstsize=size)
-            lap = cv2.subtract(gaussian_pyramid[i], expanded)
-            laplacian_pyramid.append(lap)
+            laplacian_pyramid.append(cv2.subtract(gaussian_pyramid[i], expanded))
 
         # 最后一级直接保留高斯金字塔顶层
         laplacian_pyramid.append(gaussian_pyramid[-1])
         return laplacian_pyramid
 
     def reconstruct_from_laplacian(self, laplacian_pyramid):
-        """
-        从拉普拉斯金字塔重建原始图像
-        """
+        """从拉普拉斯金字塔逐级上采样重建原始图像"""
         current = laplacian_pyramid[-1]
         for i in range(len(laplacian_pyramid) - 2, -1, -1):
-            size = (laplacian_pyramid[i].shape[0], laplacian_pyramid[i].shape[0])
-            current = cv2.pyrUp(current, dstsize=size)
-            current = cv2.add(current, laplacian_pyramid[i])
+            size = (laplacian_pyramid[i].shape[1], laplacian_pyramid[i].shape[0])
+            current = cv2.add(cv2.pyrUp(current, dstsize=size), laplacian_pyramid[i])
         return current
 
     def cv2_to_pil(self, img):
-        """OpenCV BGR 转 PIL RGB"""
-        if len(img.shape) == 2:  # 灰度图
-            return Image.fromarray(img)
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(rgb)
+        """OpenCV BGR 转 PIL RGB（单通道直接交给 PIL）"""
+        return bgr_to_pil(img)
 
+    @staticmethod
+    def _stack_layers(layers):
+        """把金字塔各层横排拼成一张图，高度对齐到第一层，宽度等比缩放。
+
+        原来每个方法都在循环里反复覆盖 processed_pil_image，
+        最后屏幕上只剩最小的一层，看不出金字塔是怎么变的。
+        """
+        target_h = layers[0].shape[0]
+        panels = []
+        for layer in layers:
+            if layer.ndim == 2:
+                layer = cv2.cvtColor(layer, cv2.COLOR_GRAY2BGR)
+            width = max(int(layer.shape[1] * target_h / layer.shape[0]), 1)
+            panels.append(cv2.resize(layer, (width, target_h)))
+        return np.hstack(panels)
+
+    @safe_process
     def imageGaussianPyramid(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图        
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度）
+        """高斯金字塔：原图 + 4 层下采样，横排显示"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        pyramid = self.build_gaussian_pyramid(img_bgr, levels=4)
+        logging.info("高斯金字塔各层尺寸: %s", [p.shape[:2] for p in pyramid])
+        self.parent_frame.processed_pil_image = bgr_to_pil(self._stack_layers(pyramid))
 
-            # 2. 构建高斯金字塔
-            gaussian_pyr = self.build_gaussian_pyramid(img_bgr, levels=4)
-
-            # 3. 转 PIL 
-            for i, g_img in enumerate(gaussian_pyr):
-                self.parent_frame.processed_pil_image = self.cv2_to_pil(g_img)
-                logging.info(f"高斯金字塔第{i}层尺寸: {g_img.shape}x{g_img.shape}")
-
+    @safe_process
     def imageLaplusPyramid(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度）
-            
-            # 2. 构建拉普拉斯金字塔
-            laplacian_pyr = self.build_laplacian_pyramid(img_bgr)
+        """拉普拉斯金字塔：各层是高频细节，横排显示"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        pyramid = self.build_laplacian_pyramid(img_bgr)
+        logging.info("拉普拉斯金字塔各层尺寸: %s", [p.shape[:2] for p in pyramid])
+        self.parent_frame.processed_pil_image = bgr_to_pil(self._stack_layers(pyramid))
 
-            # 3. 转 PIL 
-            for i, l_img in enumerate(laplacian_pyr):
-                self.parent_frame.processed_pil_image = self.cv2_to_pil(l_img)
-                logging.info(f"拉普拉斯金字塔第{i}层尺寸: {l_img.shape}x{l_img.shape}")
-
+    @safe_process
     def imageLaplacianPyramidReconstruction(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图        
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度）
+        """拉普拉斯金字塔重建：应与原图基本一致"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        pyramid = self.build_laplacian_pyramid(img_bgr, levels=4)
+        self.parent_frame.processed_pil_image = self.cv2_to_pil(
+            self.reconstruct_from_laplacian(pyramid))
 
-            # 2. 构建拉普拉斯金字塔
-            laplacian_pyr = self.build_laplacian_pyramid(img_bgr, levels=4)
-
-            # 3、重建测试
-            re_img = self.reconstruct_from_laplacian(laplacian_pyr)
-            self.parent_frame.processed_pil_image = self.cv2_to_pil(re_img)
 
 class AaffineTransformationPanel(AaffineTransformationPanelTemplate):
-    """AaffineTransformationPanel 的事件处理与算法实现。"""
+    """AaffineTransformationPanel 的事件处理与算法实现。
 
-    def imageAaffineTransformationOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageTranslation()
-            case 1:
-                self.imageRotate()
-            case 2:
-                self.imageScaling()
-            case 3:
-                self.imageShear()
-            case 4:
-                self.imageCombinationTransformation()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+    仿射变换的统一套路：构造 2x3 矩阵 -> cv2.warpAffine。
+    五种变换的差别只在于矩阵怎么算。
+    """
+
+    _HANDLERS = ("imageTranslation", "imageRotate", "imageScaling", "imageShear",
+                 "imageCombinationTransformation")
+
+    @safe_process
+    def imageAaffineTransformationOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的仿射变换选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
+    @safe_process
     def imageTranslation(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度
+        """平移：向右 100 像素、向下 50 像素"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
         h, w = img_bgr.shape[:2]
-
-        tx, ty = 100, 50  # 向右100像素，向下50像素
-        M = np.float32([[1, 0, tx], [0, 1, ty]])
-
-        dst = cv2.warpAffine(img_bgr, M, (w, h))
-
-        img_rgb = cv2.cvtColor(dst, cv2.COLOR_BGR2RGB)
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        matrix = np.float32([[1, 0, 100], [0, 1, 50]])
+        self.parent_frame.processed_pil_image = bgr_to_pil(
+            cv2.warpAffine(img_bgr, matrix, (w, h)))
 
     def rotate_arbitrary(self, img, angle, fill_color=(255, 255, 255)):
+        """绕中心旋转任意角度，并自动扩大画布避免四角被裁掉。"""
         h, w = img.shape[:2]
-        center = (w/2, h/2)
-        
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        
-        # 计算旋转后外接矩形尺寸
-        cos = np.abs(M[0, 0])
-        sin = np.abs(M[0, 1])
-        new_w = int(h * sin + w * cos)
-        new_h = int(h * cos + w * sin)
-        
+        matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+
+        cos, sin = abs(matrix[0, 0]), abs(matrix[0, 1])
+        new_w, new_h = int(h * sin + w * cos), int(h * cos + w * sin)
+
         # 补偿平移，让图像居中
-        M[0, 2] += (new_w - w) / 2
-        M[1, 2] += (new_h - h) / 2
-        
-        return cv2.warpAffine(img, M, (new_w, new_h),
+        matrix[0, 2] += (new_w - w) / 2
+        matrix[1, 2] += (new_h - h) / 2
+        return cv2.warpAffine(img, matrix, (new_w, new_h),
                               borderMode=cv2.BORDER_CONSTANT,
                               borderValue=fill_color)
 
+    @safe_process
     def imageRotate(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-        h, w = img_bgr.shape[:2]
-
-        # 以图像中心为旋转中心，逆时针旋转45度，不缩放
-        # M = cv2.getRotationMatrix2D((w/2, h/2), 45, 1.0)
-        # rotated = cv2.warpAffine(img_bgr, M, (w, h))
-        rotated = self.rotate_arbitrary(img_bgr, 45)
-
-        img_rgb = cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        """以图像中心为旋转中心，逆时针旋转 45 度，不缩放"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        self.parent_frame.processed_pil_image = bgr_to_pil(
+            self.rotate_arbitrary(img_bgr, 45))
 
     def affine_scale(self, img, sx, sy):
-        """
-        仿射变换缩放
-        :param img: OpenCV 图像 (BGR 或灰度)
-        :param sx: x 方向缩放因子
-        :param sy: y 方向缩放因子
-        :return: 缩放后的 OpenCV 图像
-        """
+        """仿射变换缩放：只改矩阵对角线元素"""
         h, w = img.shape[:2]
-        # 构造 2x3 仿射变换矩阵
-        M = np.float32([[sx, 0, 0],
-                        [0, sy, 0]])
-        # 计算输出尺寸
-        dsize = (int(w * sx), int(h * sy))
-        # 执行仿射变换，双线性插值，白色填充
-        dst = cv2.warpAffine(img, M, dsize, 
-                             flags=cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(255, 255, 255))
-        return dst
+        matrix = np.float32([[sx, 0, 0], [0, sy, 0]])
+        return cv2.warpAffine(img, matrix, (int(w * sx), int(h * sy)),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(255, 255, 255))
 
+    @safe_process
     def imageScaling(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
+        """放大 2 倍"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        self.parent_frame.processed_pil_image = bgr_to_pil(
+            self.affine_scale(img_bgr, 2, 2))
 
-        img_scaled = self.affine_scale(img_bgr, 2, 2)
-
-        img_rgb = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2RGB)
-        self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
-
+    @safe_process
     def imageShear(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
+        """水平错切 30 度：画布同步加宽，右边不会被裁掉"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        h, w = img_bgr.shape[:2]
+        theta = np.radians(30)
+        matrix = np.float32([[1, np.tan(theta), 0], [0, 1, 0]])
 
-            h, w = img_bgr.shape[:2]
+        new_w = int(w + abs(np.tan(theta)) * h)
+        matrix[0, 2] += (new_w - w) / 2       # 平移修正，让图像居中
 
-            # 2. 构造错切矩阵（水平错切 30 度）
-            theta = np.radians(30)
-            M = np.float32([[1, np.tan(theta), 0],
-                            [0, 1, 0]])
-
-            # 3. 计算新画布尺寸，避免裁剪
-            new_w = int(w + abs(np.tan(theta)) * h)
-            new_h = h
-            # 平移修正，让图像居中显示
-            M[0, 2] += (new_w - w) / 2
-
-            # 4. 应用仿射变换
-            sheared = cv2.warpAffine(img_bgr, M, (new_w, new_h), 
-                                      flags=cv2.INTER_LINEAR, 
-                                      borderMode=cv2.BORDER_CONSTANT, 
-                                      borderValue=(255, 255, 255))
-            img_rgb = cv2.cvtColor(sheared, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+        sheared = cv2.warpAffine(img_bgr, matrix, (new_w, h),
+                                 flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT,
+                                 borderValue=(255, 255, 255))
+        self.parent_frame.processed_pil_image = bgr_to_pil(sheared)
 
     def combined_affine(self, image, rotate_angle=0, scale=1.0, translate=(0, 0), center=None):
+        """旋转 + 缩放 + 平移：三个矩阵乘成一个，只需一次插值"""
         h, w = image.shape[:2]
         if center is None:
             center = (w // 2, h // 2)
-        
-        # 1. 旋转+缩放矩阵（2x3）
-        M_rot_scale = cv2.getRotationMatrix2D(center, rotate_angle, scale)
-        # 2. 平移矩阵（2x3）
-        print(translate, type(translate))
-        M_translate = np.float32([[1, 0, translate[0]], [0, 1, translate[1]]])
-        
-        # 3. 补成 3x3 齐次坐标形式，才能矩阵相乘
-        M_rot_scale_h = np.vstack([M_rot_scale, [0, 0, 1]])
-        M_translate_h = np.vstack([M_translate, [0, 0, 1]])
-            # 4. 矩阵相乘（注意顺序：先旋转缩放，再平移）
-        M_combined_h = M_translate_h @ M_rot_scale_h
-        M_combined = M_combined_h[:2]  # 取回 2x3
-        
-        # 5. 一次性执行仿射变换
-        result = cv2.warpAffine(image, M_combined, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
-        return result, M_combined
 
+        rot_scale = cv2.getRotationMatrix2D(center, rotate_angle, scale)
+        translate_matrix = np.float32([[1, 0, translate[0]], [0, 1, translate[1]]])
+
+        # 补成 3x3 齐次矩阵才能相乘
+        rot_scale_h = np.vstack([rot_scale, [0, 0, 1]])
+        translate_h = np.vstack([translate_matrix, [0, 0, 1]])
+        combined = (translate_h @ rot_scale_h)[:2]     # 先旋转缩放，再平移
+
+        result = cv2.warpAffine(image, combined, (w, h),
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(255, 255, 255))
+        return result, combined
+
+    @safe_process
     def imageCombinationTransformation(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
+        """组合变换：旋转 30 度 + 放大 2 倍 + 平移 (100, 100)"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        result, _ = self.combined_affine(img_bgr, 30, 2, (100, 100))
+        self.parent_frame.processed_pil_image = bgr_to_pil(result)
 
-            result,_ = self.combined_affine(img_bgr, 30, 2, (100,100))
-            img_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
 
 class PerspectiveTransformationPanel(PerspectiveTransformationPanelTemplate):
     """PerspectiveTransformationPanel 的事件处理与算法实现。"""
@@ -2180,7 +1830,7 @@ class PerspectiveTransformationPanel(PerspectiveTransformationPanelTemplate):
         pil_img             = self.parent_frame.original_pil_image  
         if pil_img: 
             # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr                 = frame_bgr(self.parent_frame)
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
 
             h, w = img_bgr.shape[:2]
@@ -2195,8 +1845,8 @@ class PerspectiveTransformationPanel(PerspectiveTransformationPanelTemplate):
 
             # 5. 执行透视变换，输出尺寸 (width, height)
             warped = cv2.warpPerspective(img_bgr, M, (188, 262))
-            img_rgb = cv2.cvtColor(warped, cv2.COLOR_BGR2RGB)
-            self.parent_frame.processed_pil_image = Image.fromarray(img_rgb)
+            self.parent_frame.processed_pil_image = bgr_to_pil(warped)
+
 
 class FourierTransformationPanel(FourierTransformationPanelTemplate):
     """FourierTransformationPanel 的事件处理与算法实现。"""
@@ -2208,8 +1858,7 @@ class FourierTransformationPanel(FourierTransformationPanelTemplate):
             case 1:
                 self.imageFourierRestored()
             case _:
-                print("error")
-                event.Skip()
+                logging.warning("未知的选项: %s", self.m_radioBox2.GetSelection())
         self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
         event.Skip()
 
@@ -2225,7 +1874,7 @@ class FourierTransformationPanel(FourierTransformationPanelTemplate):
         pil_img             = self.parent_frame.original_pil_image  
         if pil_img: 
             # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr                 = frame_bgr(self.parent_frame)
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
             
             # 2. 转 float32（cv2.dft 不接受 uint8）
@@ -2260,7 +1909,7 @@ class FourierTransformationPanel(FourierTransformationPanelTemplate):
         pil_img             = self.parent_frame.original_pil_image  
         if pil_img: 
             # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr                 = frame_bgr(self.parent_frame)
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
 
             # 2. 转 float32（cv2.dft 不接受 uint8）
@@ -2291,6 +1940,7 @@ class FourierTransformationPanel(FourierTransformationPanelTemplate):
             
             self.parent_frame.processed_pil_image = Image.fromarray(img_back)
 
+
 class FloodFillPanel(FloodFillPanelTemplate):
     """FloodFillPanel 的事件处理与算法实现。"""
 
@@ -2308,7 +1958,7 @@ class FloodFillPanel(FloodFillPanelTemplate):
         pil_img             = self.parent_frame.original_pil_image
         if pil_img: 
             # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+            img_bgr                 = frame_bgr(self.parent_frame)
             img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
 
             h, w = img_bgr.shape[:2]
@@ -2329,410 +1979,277 @@ class FloodFillPanel(FloodFillPanelTemplate):
             # 6. OpenCV BGR -> RGB，再转 PIL Image
             self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
 
-class RemappingPanel(RemappingPanelTemplate):
-    """RemappingPanel 的事件处理与算法实现。"""
 
-    def imageRemappingOnRadioBox( self, event ): 
-        match self.m_radioBox2.GetSelection():
-            case 0:
-                self.imageHorizontalMirror()
-            case 1:
-                self.imageVerticalMirror()
-            case 2:
-                self.imageFlipAroundXYAxis()
-            case 3:
-                self.imageCompressYAxisByHalf()
-            case 4:
-                self.imageCompressXAxisByHalf()
-            case 5:
-                self.imageCompressEachXAndYAxesByHalf()
-            case _:
-                print("error")
-                event.Skip()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+class RemappingPanel(RemappingPanelTemplate):
+    """RemappingPanel 的事件处理与算法实现。
+
+    map_x / map_y 的含义：目标图 (x, y) 处的像素取自原图的 (map_x[y,x], map_y[y,x])。
+    dtype 必须是 np.float32，否则 cv2.remap 直接报错。
+
+    原理演示用的是坐标映射，所以复用同一套骨架；原来每个方法都写了一遍
+    h*w 的双重 for 循环（750x437 就是 33 万次 Python 迭代），
+    这里换成 np.indices 向量化，快两个数量级。
+    """
+
+    _HANDLERS = ("imageHorizontalMirror", "imageVerticalMirror", "imageFlipAroundXYAxis",
+                 "imageCompressXAxisByHalf", "imageCompressYAxisByHalf",
+                 "imageCompressEachXAndYAxesByHalf")
+
+    @safe_process
+    def imageRemappingOnRadioBox(self, event):
+        index = self.m_radioBox2.GetSelection()
+        if 0 <= index < len(self._HANDLERS):
+            getattr(self, self._HANDLERS[index])()
+        else:
+            logging.warning("未知的重映射选项: %s", index)
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
+    def _apply(self, build_maps):
+        """build_maps(xs, ys, h, w) -> (map_x, map_y)，各算法只描述映射规则。"""
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        h, w = img_bgr.shape[:2]
+        ys, xs = np.indices((h, w), dtype=np.float32)   # xs 是列号，ys 是行号
+        map_x, map_y = build_maps(xs, ys, h, w)
+        remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
+        self.parent_frame.processed_pil_image = bgr_to_pil(remapped)
+
     def imageHorizontalMirror(self):
-        """
-        关键说明:
-        1、映射矩阵类型：map_x 和 map_y 必须是 np.float32，否则 cv2.remap() 会报错。
-        2、坐标含义    ：map_x[y, x] 存的是目标图 (x, y) 处像素取自原图的 x 坐标，map_y 同理存 y 坐标。
-        3、向量化优化  ：双重循环慢，可用 NumPy 向量化替代。
-        4、其他常用映射规则
-            垂直镜像：map_y[y, x] = h - 1 - y，x 不变。
-            绕 XY 轴翻转：x 和 y 坐标都反转。
-            压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-        """
-        pil_img             = self.parent_frame.original_pil_image
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-
-            # OpenCV 默认 BGR 格式            
-            h, w = img_bgr.shape[:2]
-
-            # 2. 构建映射矩阵（水平镜像：x 坐标翻转，y 坐标不变）
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)
-            # 水平镜像算法
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] = w - 1 - x
-                    map_y[y, x] = y
-            # 垂直镜像算法
-            # for y in range(h):
-            #     for x in range(w):
-            #         map_x[y, x] = x
-            #         map_y[y, x] = h -1 -y
-            # 绕 XY 轴翻转：x 和 y 坐标都反转
-            # for y in range(h):
-            #     for x in range(w):
-            #         map_x[y, x] = w -1 -x
-            #         map_y[y, x] = h -1 -y
-            # 压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-            # for y in range(h):
-            #     for x in range(w):
-            #         map_x[y, x] =  x
-            #         map_y[y, x] =  2 * y
-
-            # 3. 应用重映射
-            remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-            # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+        """水平镜像：x 翻转，y 不变"""
+        self._apply(lambda xs, ys, h, w: (w - 1 - xs, ys))
 
     def imageVerticalMirror(self):
-        pil_img             = self.parent_frame.original_pil_image
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-
-            # OpenCV 默认 BGR 格式            
-            h, w = img_bgr.shape[:2]
-
-            # 2. 构建映射矩阵（水平镜像：x 坐标翻转，y 坐标不变）
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)           
-            #垂直镜像算法
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] = x
-                    map_y[y, x] = h -1 -y
-            # 绕 XY 轴翻转：x 和 y 坐标都反转
-            # for y in range(h):
-            #     for x in range(w):
-            #         map_x[y, x] = w -1 -x
-            #         map_y[y, x] = h -1 -y
-            # 压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-            # for y in range(h):
-            #     for x in range(w):
-            #         map_x[y, x] =  x
-            #         map_y[y, x] =  2 * y
-
-            # 3. 应用重映射
-            remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-            # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+        """垂直镜像：y 翻转，x 不变"""
+        self._apply(lambda xs, ys, h, w: (xs, h - 1 - ys))
 
     def imageFlipAroundXYAxis(self):
-        pil_img             = self.parent_frame.original_pil_image
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-
-            # OpenCV 默认 BGR 格式            
-            h, w = img_bgr.shape[:2]
-
-            # 2. 构建映射矩阵（水平镜像：x 坐标翻转，y 坐标不变）
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)
-            #绕 XY 轴翻转：x 和 y 坐标都反转
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] = w -1 -x
-                    map_y[y, x] = h -1 -y
-            # 压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-            # for y in range(h):
-            #     for x in range(w):
-            #         map_x[y, x] =  x
-            #         map_y[y, x] =  2 * y
-
-            # 3. 应用重映射
-            remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-            # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+        """绕 XY 轴翻转：x、y 都翻转，等价于旋转 180 度"""
+        self._apply(lambda xs, ys, h, w: (w - 1 - xs, h - 1 - ys))
 
     def imageCompressXAxisByHalf(self):
-        pil_img             = self.parent_frame.original_pil_image
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-
-            # OpenCV 默认 BGR 格式            
-            h, w = img_bgr.shape[:2]
-
-            # 2. 构建映射矩阵（水平镜像：x 坐标翻转，y 坐标不变）
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)
-            #绕 XY 轴翻转：x 和 y 坐标都反转                
-            #压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] =  x
-                    map_y[y, x] =  2 * y
-
-            # 3. 应用重映射
-            remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-            # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+        """x 方向压缩一半：map_x = 2*x（右半边会被裁掉）"""
+        self._apply(lambda xs, ys, h, w: (2 * xs, ys))
 
     def imageCompressYAxisByHalf(self):
-        pil_img             = self.parent_frame.original_pil_image
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-
-            # OpenCV 默认 BGR 格式            
-            h, w = img_bgr.shape[:2]
-
-            # 2. 构建映射矩阵（水平镜像：x 坐标翻转，y 坐标不变）
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)
-            #绕 XY 轴翻转：x 和 y 坐标都反转                
-            #压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] =  2 * x
-                    map_y[y, x] =  y
-
-            # 3. 应用重映射
-            remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-            # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
+        """y 方向压缩一半：map_y = 2*y（下半部分会被裁掉）"""
+        self._apply(lambda xs, ys, h, w: (xs, 2 * ys))
 
     def imageCompressEachXAndYAxesByHalf(self):
-        pil_img             = self.parent_frame.original_pil_image
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
+        """x、y 同时压缩一半：整幅图缩到左上角 1/4"""
+        self._apply(lambda xs, ys, h, w: (2 * xs, 2 * ys))
 
-            # OpenCV 默认 BGR 格式            
-            h, w = img_bgr.shape[:2]
-
-            # 2. 构建映射矩阵（水平镜像：x 坐标翻转，y 坐标不变）
-            map_x = np.zeros((h, w), dtype=np.float32)
-            map_y = np.zeros((h, w), dtype=np.float32)
-            #绕 XY 轴翻转：x 和 y 坐标都反转                
-            #压缩一半：map_y[y, x] = 2 * y，图像在 y 方向缩小一半
-            for y in range(h):
-                for x in range(w):
-                    map_x[y, x] =  2 * x
-                    map_y[y, x] =  2 * y
-
-            # 3. 应用重映射
-            remapped = cv2.remap(img_bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR)
-            # 4. 转成 PIL Image（BGR -> RGB）            
-            self.parent_frame.processed_pil_image = Image.fromarray(cv2.cvtColor(remapped, cv2.COLOR_BGR2RGB))
 
 class BackProjectionPanel(BackProjectionPanelTemplate):
     """BackProjectionPanel 的事件处理与算法实现。"""
 
-    def imageBackProjectionOnBtnClick( self, event ):
+    @safe_process
+    def imageBackProjectionOnBtnClick(self, event):
         self.imageBackProjectionOnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def imageBackProjectionOnBtnClickPro(self):
-        roi_img             = self.parent_frame.original_pil_image
-        target_img          = self.parent_frame.processed_pil_image
-        if roi_img: 
-            # 1. 读取原图
-            target_bgr = cv2.cvtColor(np.asarray(target_img), cv2.COLOR_RGB2BGR)
+        """反向投影：用左侧图当样本、右侧图当目标，找出目标里与样本相似的颜色区域。"""
+        roi_img = self.parent_frame.original_pil_image
+        target_img = self.parent_frame.processed_pil_image
+        if roi_img is None:
+            return
+        if target_img is None:
+            wx.MessageBox("请先点「打开目标图片」选一张要在其中搜索的图片。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
 
-            # 2. 转 HSV 色彩空间（只用 H 和 S 通道，减弱光照影响）
-            roi_hsv     = cv2.cvtColor(np.asarray(roi_img), cv2.COLOR_BGR2HSV)
-            target_hsv  = cv2.cvtColor(np.asarray(target_img), cv2.COLOR_BGR2HSV)
-            
-            # 3. 计算模板的 2D 直方图（H: 0-180, S: 0-256）
-            roi_hist    = cv2.calcHist([roi_hsv], [0, 1], None, [180, 256], [0, 180, 0, 256])
-            
-            # 4. 归一化直方图到 0~255，这一步很关键
-            cv2.normalize(roi_hist, roi_hist, 0, 255, cv2.NORM_MINMAX)
-            
-            # 5. 反向投影：把模板直方图“投影”到目标图上
-            back_proj   = cv2.calcBackProject([target_hsv], [0, 1], roi_hist, [0, 180, 0, 256], 1)
-            
-            # 6. 用椭圆核做卷积，把离散的点连成片（可选但推荐）
-            kernel      = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            back_proj   = cv2.filter2D(back_proj, -1, kernel)
-            
-            # 7. 阈值二值化，只保留匹配度高的区域
-            _, thresh   = cv2.threshold(back_proj, 50, 255, cv2.THRESH_BINARY)
-            
-            # 8. 把结果从 OpenCV 的 BGR 格式转成 PIL Image
-            # 反向投影结果是单通道灰度图，先转成 PIL 直接可用
-            back_proj_pil   = Image.fromarray(back_proj)  # 灰度图直接转
-            thresh_pil      = Image.fromarray(thresh)     # 二值图直接转
-            
-            # 如果想看彩色结果（原图上标出匹配区域），可以这样做：
-            # 把二值图合并成 3 通道，再与原图做按位与
-            thresh_3ch = cv2.merge([thresh, thresh, thresh])
-            result     = cv2.bitwise_and(target_bgr, thresh_3ch)
-            result_pil = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+        # 1. 统一转成 BGR（PIL 是 RGB，直接 cvtColor(BGR2HSV) 会算错通道）
+        roi_bgr = pil_to_bgr(roi_img)
+        target_bgr = pil_to_bgr(target_img)
 
-            self.parent_frame.processed_pil_image = result_pil
+        # 2. 转 HSV 色彩空间（只用 H 和 S 通道，减弱光照影响）
+        roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+        target_hsv = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2HSV)
+
+        # 3. 计算样本的 2D 直方图（H: 0-180, S: 0-256）
+        roi_hist = cv2.calcHist([roi_hsv], [0, 1], None, [180, 256], [0, 180, 0, 256])
+        # 4. 归一化到 0~255，这一步很关键
+        cv2.normalize(roi_hist, roi_hist, 0, 255, cv2.NORM_MINMAX)
+
+        # 5. 反向投影：把样本直方图"投影"到目标图上
+        back_proj = cv2.calcBackProject([target_hsv], [0, 1], roi_hist, [0, 180, 0, 256], 1)
+
+        # 6. 用椭圆核做卷积，把离散的点连成片
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        back_proj = cv2.filter2D(back_proj, -1, kernel)
+
+        # 7. 阈值二值化，只保留匹配度高的区域
+        _, thresh = cv2.threshold(back_proj, 50, 255, cv2.THRESH_BINARY)
+
+        # 8. 二值图与原图按位与，得到彩色的匹配结果
+        thresh_3ch = cv2.merge([thresh, thresh, thresh])
+        result = cv2.bitwise_and(target_bgr, thresh_3ch)
+        self.parent_frame.processed_pil_image = bgr_to_pil(result)
+
 
 class CameraPanel(CameraPanelTemplate):
     """CameraPanel 暂无算法实现。"""
     pass
 
+
 class CoordinateCalibrationPanel(CoordinateCalibrationPanelTemplate):
     """CoordinateCalibrationPanel 暂无算法实现。"""
     pass
 
+
 class OcrPanel(OcrPanelTemplate):
     """OcrPanel 的事件处理与算法实现。"""
 
-    def imageOcrOnBtnClick( self, event ):
+    @safe_process
+    def imageOcrOnBtnClick(self, event):
         self.imageOcrOnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def imageOcrOnBtnClickPro(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
+        gray = frame_gray(self.parent_frame)
+        if gray is None:
+            return
+        if not ensure_tesseract():
+            wx.MessageBox("未安装 pytesseract，无法进行文字识别。",
+                          "缺少依赖", wx.OK | wx.ICON_WARNING, self)
+            return
 
-            binary = cv2.adaptiveThreshold(img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY, 31, 10)
+        # 自适应阈值：对光照不均的文档比全局阈值更稳
+        binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 31, 10)
+        try:
+            text = pytesseract.image_to_string(binary, config=r'--oem 3 --psm 6 -l chi_sim+eng')
+        except Exception as exc:
+            logging.exception("OCR 识别失败")
+            wx.MessageBox(f"OCR 识别失败，请检查 tesseract 与中文语言包：\n{exc}",
+                          "识别失败", wx.OK | wx.ICON_ERROR, self)
+            text = ""
+        logging.info("识别结果: %s", text)
+        self.parent_frame.imageInfoStaticText.SetLabel(f"识别结果: {text.strip()}")
+        self.parent_frame.processed_pil_image = bgr_to_pil(binary)
 
-            # 3. 识别文字（直接传 numpy 数组给 pytesseract 也可以）
-            #    这里演示传入二值化后的图像
-            pytesseract.pytesseract.tesseract_cmd = r'D:\Tesseract-OCR\tesseract.exe'
-            custom_config = r'--oem 3 --psm 6 -l chi_sim+eng'
-            text = pytesseract.image_to_string(binary, config=custom_config)
-            self.parent_frame.imageInfoStaticText.SetLabel(f"识别结果:{text}")
-            logging.info(f"识别结果:{text}")
-
-            # 可以把二值化结果转成 PIL 灰度图
-            self.parent_frame.processed_pil_image = Image.fromarray(binary)
 
 class VehicleLicensePlateRecognitionPanel(VehicleLicensePlateRecognitionPanelTemplate):
     """VehicleLicensePlateRecognitionPanel 的事件处理与算法实现。"""
 
-    def imageVLPROnBtnClick( self, event ):
+    @safe_process
+    def imageVLPROnBtnClick(self, event):
         self.imageVLPROnBtnClickPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def locate_license_plate(self, edged, img):
-        """定位车牌区域：形态学闭运算 + 轮廓筛选"""
+        """定位车牌区域：形态学闭运算 + 轮廓筛选（矩形 + 宽高比 2~5）"""
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 5))
         closed = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kernel)
-        
+
         contours, _ = cv2.findContours(closed.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        contours    = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-        
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
         for contour in contours:
-            peri   = cv2.arcLength(contour, True)
+            peri = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-            
-            if len(approx) == 4:
-                x, y, w, h = cv2.boundingRect(contour)
-                aspect_ratio = w / float(h)
-                # 车牌宽高比一般在 2~5 之间
-                if 2 < aspect_ratio < 5:
-                    return (x, y, w, h), approx
-        
+            if len(approx) != 4:
+                continue
+            x, y, w, h = cv2.boundingRect(contour)
+            if h > 0 and 2 < w / float(h) < 5:      # 车牌宽高比一般 2~5
+                return (x, y, w, h), approx
         return None, None
 
     def segment_characters(self, plate_img):
-        """分割车牌字符：二值化 + 垂直投影"""
+        """字符分割的第一步：灰度 + Otsu 反色二值化（字符为白）"""
         gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        return binary
+        return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
 
     def recognize_with_tesseract(self, char_img):
-        """用 Tesseract OCR 识别字符（需安装 pytesseract）"""
-        import pytesseract
-        pil_img = Image.fromarray(char_img)
+        """用 Tesseract 识别字符（白名单限定为数字 + 大写字母）"""
+        if not ensure_tesseract():          # 和 OCR 面板共用同一个 tesseract 路径配置
+            return ""
         config = '--psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        text = pytesseract.image_to_string(pil_img, config=config)
-        return text.strip()
+        return pytesseract.image_to_string(Image.fromarray(char_img), config=config).strip()
 
     def imageVLPROnBtnClickPro(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
-            blurred                 = cv2.GaussianBlur(img_gray, (5, 5), 0)
-            edged                   = cv2.Canny(blurred, 50, 150)
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
 
-            # 2. 定位车牌
-            plate_rect, plate_contour = self.locate_license_plate(edged, img_bgr)
-            
-            if plate_rect is None:
-                print("未检测到车牌区域")
-                return None
-            
-            x, y, w, h = plate_rect
-            plate_img  = img_bgr[y:y+h, x:x+w]
-            
-            # 3. 字符分割
-            char_binary = self.segment_characters(plate_img)
-            
-            # 4. 字符识别（可选，需安装 pytesseract）
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 50, 150)
+
+        plate_rect, _ = self.locate_license_plate(edged, img_bgr)
+        if plate_rect is None:
+            logging.info("未检测到车牌区域")
+            wx.MessageBox("没有定位到车牌，可以换一张角度更正的照片试试。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
+
+        x, y, w, h = plate_rect
+        plate_img = img_bgr[y:y + h, x:x + w]
+        if plate_img.size == 0:
+            return
+
+        char_binary = self.segment_characters(plate_img)
+        try:
             plate_text = self.recognize_with_tesseract(char_binary)
-            print(f"识别结果: {plate_text}")
-            
-            # 5. 在原图上画框
-            result_img = img_bgr.copy()
-            cv2.rectangle(result_img, (x, y), (x+w, y+h), (0, 255, 0), 3)
+        except Exception:
+            logging.exception("车牌字符识别失败")
+            plate_text = ""
+        logging.info("车牌识别结果: %s", plate_text)
+        if plate_text:
+            self.parent_frame.imageInfoStaticText.SetLabel(f"车牌识别结果: {plate_text}")
 
-            self.parent_frame.processed_pil_image = Image.fromarray(result_img)
+        result_img = img_bgr.copy()
+        cv2.rectangle(result_img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+        if plate_text:
+            cv2.putText(result_img, plate_text, (x, max(y - 10, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+        self.parent_frame.processed_pil_image = bgr_to_pil(result_img)
+
 
 class QRCodeRecognizationPanel(QRCodeRecognizationPanelTemplate):
     """QRCodeRecognizationPanel 的事件处理与算法实现。"""
 
-    def imageQRCodeRecognizationOnBtnClick( self, event ):
+    @safe_process
+    def imageQRCodeRecognizationOnBtnClick(self, event):
         self.imageQRCodeRecognizationOnPro()
-        self.GetEventHandler().ProcessEvent(self.evt)  # 触发事件  
+        self.GetEventHandler().ProcessEvent(self.evt)   # 触发右侧面板刷新
         event.Skip()
 
     def imageQRCodeRecognizationOnPro(self):
-        pil_img             = self.parent_frame.original_pil_image  
-        if pil_img: 
-            # 1. 读取原图并转灰度图     
-            img_bgr                 = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            img_gray                = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)  # 2. 将原图转为灰度图（模板匹配要求灰度)
+        img_bgr = frame_bgr(self.parent_frame)
+        if img_bgr is None:
+            return
+        try:
+            from pyzbar.pyzbar import decode         # 可选依赖，延迟导入
+        except ImportError:
+            wx.MessageBox("未安装 pyzbar，无法识别二维码。\n可执行：pip install pyzbar",
+                          "缺少依赖", wx.OK | wx.ICON_WARNING, self)
+            return
 
-            _, binary = cv2.threshold(img_gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        # 直接对灰度图解码比先二值化更稳（pyzbar 内部会自己做二值化）
+        decoded_objects = decode(gray)
 
-            # 3. pyzbar 识别二维码
-            from pyzbar.pyzbar import decode
-            decoded_objects = decode(binary)
+        if not decoded_objects:
+            logging.info("未识别到二维码")
+            wx.MessageBox("没有识别到二维码，试试裁剪到二维码区域再点一次。",
+                          "提示", wx.OK | wx.ICON_INFORMATION, self)
+            return
 
-            # 4. 在图上画框并打印结果
-            for obj in decoded_objects:
-                data = obj.data.decode('utf-8')
-                print(f"识别内容: {data}")
-                print(f"码制类型: {obj.type}")
+        for obj in decoded_objects:
+            data = obj.data.decode('utf-8', errors='replace')   # 容错，避免解码异常
+            logging.info("识别内容: %s (%s)", data, obj.type)
+            if obj.polygon:
+                points = np.array(obj.polygon, dtype=np.int32)
+                cv2.polylines(img_bgr, [points], True, (0, 255, 0), 3)
+            x, y, _, _ = obj.rect
+            cv2.putText(img_bgr, data, (x, max(y - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            self.parent_frame.imageInfoStaticText.SetLabel(f"二维码内容: {data}")
 
-                # 画多边形框
-                points = obj.polygon
-                if points:
-                    pts = np.array(points, dtype=np.int32)
-                    cv2.polylines(img_bgr, [pts], True, (0, 255, 0), 3)
-
-                # 显示文字
-                x, y, w, h = obj.rect
-                cv2.putText(img_bgr, data, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,0.7, (0, 255, 0), 2)
-
-                self.parent_frame.processed_pil_image = Image.fromarray(img_bgr)
+        self.parent_frame.processed_pil_image = bgr_to_pil(img_bgr)
